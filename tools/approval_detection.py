@@ -26,6 +26,19 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
+# ``config set``/``unset`` is the supported front door to the same policy file.
+# Profile selection is pre-parsed from anywhere in argv, so permit it in each
+# gap that can survive in the raw command seen by the terminal guard.
+_HERMES_PROFILE_FLAG = r'(?:--profile(?:=\S+|\s+\S+)|-p\s+\S+)'
+_HERMES_PROFILE_FLAGS = rf'(?:\s+{_HERMES_PROFILE_FLAG})*'
+# Top-level argparse flags can precede the subcommand; conservatively allow any
+# option plus an optional operand so new global flags cannot reopen this gate.
+_HERMES_GLOBAL_FLAGS = r'(?:\s+-{1,2}\S+(?:\s+\S+)?)*'
+_HERMES_SECURITY_CONFIG_KEY = (
+    r"(?:approvals(?:\.[^\s\"'`]+)?|security(?:\.[^\s\"'`]+)?|"
+    r"command_allowlist(?:\.[^\s\"'`]+)?|yolo)"
+)
+_SECURITY_CONFIG_APPROVAL_KEY = "modify Hermes security policy via config"
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
@@ -305,6 +318,21 @@ DANGEROUS_PATTERNS = [
     # between `hermes` and `gateway` (`hermes -p ade gateway restart`) are allowed so a profile flag can't slip past.
     (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
+    # The documented config CLI writes the same config.yaml protected above.
+    # Gate only policy namespaces; ordinary model/display changes stay usable.
+    (
+        rf'\bhermes{_HERMES_GLOBAL_FLAGS}\s+config{_HERMES_PROFILE_FLAGS}'
+        rf'\s+(?:set|unset){_HERMES_PROFILE_FLAGS}\s+(?:--force\s+)?'
+        rf'["\']?{_HERMES_SECURITY_CONFIG_KEY}["\']?(?:\s|$)',
+        _SECURITY_CONFIG_APPROVAL_KEY,
+    ),
+    # The module invocation is a supported alias for the same writer.
+    (
+        rf'\bpython(?:3(?:\.\d+)?)?\s+-m\s+hermes_cli\.main{_HERMES_GLOBAL_FLAGS}'
+        rf'\s+config{_HERMES_PROFILE_FLAGS}\s+(?:set|unset){_HERMES_PROFILE_FLAGS}'
+        rf'\s+(?:--force\s+)?["\']?{_HERMES_SECURITY_CONFIG_KEY}["\']?(?:\s|$)',
+        _SECURITY_CONFIG_APPROVAL_KEY,
+    ),
     # Docker/Podman daemon redirect — global flags or env that point the CLI at a DIFFERENT (often remote) daemon:
     # `docker -H ssh://prod stop app` looks local but operates on remote infra, so any redirect requires approval
     # regardless of subcommand. The flag must be in global position (before the subcommand) and -H/--host/--context

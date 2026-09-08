@@ -337,6 +337,22 @@ class TestHermesConfigWriteProtection:
             assert key is not None, command
 
 
+    def test_policy_mutation_cli_front_doors_require_approval(self):
+        for command in (
+            "hermes config set approvals.single_query_mode approve",
+            "hermes --yolo config set approvals.single_query_mode approve",
+            "hermes --reasoning high config set approvals.mode off",
+            "hermes config set --force approvals.mode off",
+            "hermes --profile prod config unset security.tirith_enabled",
+            "hermes -p prod config set command_allowlist '[\"git status\"]'",
+            "hermes config set yolo true",
+            "python -m hermes_cli.main config set approvals.single_query_mode approve",
+        ):
+            dangerous, key, desc = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key == "modify Hermes security policy via config", command
+            assert desc == key, command
+
     def test_reads_and_unrelated_writes_are_safe(self):
         # Reading config is not a write; a non-Hermes absolute config.yaml is
         # handled by the project patterns, not the Hermes-home rule.

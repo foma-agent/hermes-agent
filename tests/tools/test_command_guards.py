@@ -149,6 +149,29 @@ class TestTirithAllowDangerous:
         assert cb.call_args[1]["allow_permanent"] is True
 
 
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_policy_mutation_approval_is_one_shot(self, mock_tirith, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        session_key = "policy-mutation-one-shot"
+        token = set_current_session_key(session_key)
+        callback = MagicMock(side_effect=["always", "deny"])
+        command = "hermes config set approvals.single_query_mode approve"
+
+        try:
+            first = check_all_command_guards(command, "local", approval_callback=callback)
+            second = check_all_command_guards(command, "local", approval_callback=callback)
+        finally:
+            reset_current_session_key(token)
+
+        assert first["approved"] is True
+        assert second["approved"] is False
+        assert callback.call_count == 2
+        assert all(call.kwargs["allow_session"] is False for call in callback.call_args_list)
+        assert all(call.kwargs["allow_permanent"] is False for call in callback.call_args_list)
+        _, pattern_key, _ = approval_module.detect_dangerous_command(command)
+        assert is_approved(session_key, pattern_key) is False
+
+
 # ---------------------------------------------------------------------------
 # tirith warn + safe command
 # ---------------------------------------------------------------------------
