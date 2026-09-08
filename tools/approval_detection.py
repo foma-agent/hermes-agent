@@ -1405,8 +1405,23 @@ def _python_hermes_module_argv(tokens: list[str]) -> list[str] | None:
             return None
         if token.startswith("-m") and token[2:] == "hermes_cli.main":
             return tokens[index + 1:]
-        if token == "--" or not token.startswith("-"):
+        if token.startswith("-") and not token.startswith("--"):
+            short_flags = token[1:]
+            module_flag = short_flags.find("m")
+            if module_flag >= 0 and not any(
+                flag in "cWX" for flag in short_flags[:module_flag]
+            ):
+                attached_module = short_flags[module_flag + 1:]
+                if attached_module:
+                    return tokens[index + 1:] if attached_module == "hermes_cli.main" else None
+                if index + 1 < len(tokens) and tokens[index + 1] == "hermes_cli.main":
+                    return tokens[index + 2:]
+                return None
+        if token == "--":
             return None
+        if not token.startswith("-"):
+            script = token.replace("\\", "/")
+            return tokens[index + 1:] if script.endswith("hermes_cli/main.py") else None
         option = token.split("=", 1)[0]
         if "=" not in token and option in _INTERPRETER_WITH_ARG["python"]:
             index += 2

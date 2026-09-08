@@ -355,6 +355,10 @@ class TestHermesConfigWriteProtection:
             "python -mhermes_cli.main config set approvals.mode off",
             "python -u -m hermes_cli.main config set approvals.mode off",
             "python -I -m hermes_cli.main config set approvals.mode off",
+            "python -um hermes_cli.main config set approvals.mode off",
+            "python -Im hermes_cli.main config set approvals.mode off",
+            "python hermes_cli/main.py config set approvals.mode off",
+            "/usr/bin/python ./hermes_cli/main.py config unset security.tirith_enabled",
         ):
             dangerous, key, desc = detect_dangerous_command(command)
             assert dangerous is True, command
