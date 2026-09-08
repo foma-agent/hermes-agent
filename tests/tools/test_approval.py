@@ -340,13 +340,21 @@ class TestHermesConfigWriteProtection:
     def test_policy_mutation_cli_front_doors_require_approval(self):
         for command in (
             "hermes config set approvals.single_query_mode approve",
+            "hermes config set 'approvals'.mode off",
+            'hermes config set ap"provals".mode off',
+            'hermes config set approvals".mode" off',
             "hermes --yolo config set approvals.single_query_mode approve",
             "hermes --reasoning high config set approvals.mode off",
             "hermes config set --force approvals.mode off",
+            "hermes config set -- approvals.mode off",
+            "hermes config set --force --force approvals.mode off",
             "hermes --profile prod config unset security.tirith_enabled",
             "hermes -p prod config set command_allowlist '[\"git status\"]'",
             "hermes config set yolo true",
             "python -m hermes_cli.main config set approvals.single_query_mode approve",
+            "python -mhermes_cli.main config set approvals.mode off",
+            "python -u -m hermes_cli.main config set approvals.mode off",
+            "python -I -m hermes_cli.main config set approvals.mode off",
         ):
             dangerous, key, desc = detect_dangerous_command(command)
             assert dangerous is True, command

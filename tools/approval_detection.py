@@ -26,18 +26,6 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
-# ``config set``/``unset`` is the supported front door to the same policy file.
-# Profile selection is pre-parsed from anywhere in argv, so permit it in each
-# gap that can survive in the raw command seen by the terminal guard.
-_HERMES_PROFILE_FLAG = r'(?:--profile(?:=\S+|\s+\S+)|-p\s+\S+)'
-_HERMES_PROFILE_FLAGS = rf'(?:\s+{_HERMES_PROFILE_FLAG})*'
-# Top-level argparse flags can precede the subcommand; conservatively allow any
-# option plus an optional operand so new global flags cannot reopen this gate.
-_HERMES_GLOBAL_FLAGS = r'(?:\s+-{1,2}\S+(?:\s+\S+)?)*'
-_HERMES_SECURITY_CONFIG_KEY = (
-    r"(?:approvals(?:\.[^\s\"'`]+)?|security(?:\.[^\s\"'`]+)?|"
-    r"command_allowlist(?:\.[^\s\"'`]+)?|yolo)"
-)
 _SECURITY_CONFIG_APPROVAL_KEY = "modify Hermes security policy via config"
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
@@ -318,21 +306,6 @@ DANGEROUS_PATTERNS = [
     # between `hermes` and `gateway` (`hermes -p ade gateway restart`) are allowed so a profile flag can't slip past.
     (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*gateway\s+(stop|restart)\b', "stop/restart hermes gateway (kills running agents)"),
     (r'\bhermes\s+update\b', "hermes update (restarts gateway, kills running agents)"),
-    # The documented config CLI writes the same config.yaml protected above.
-    # Gate only policy namespaces; ordinary model/display changes stay usable.
-    (
-        rf'\bhermes{_HERMES_GLOBAL_FLAGS}\s+config{_HERMES_PROFILE_FLAGS}'
-        rf'\s+(?:set|unset){_HERMES_PROFILE_FLAGS}\s+(?:--force\s+)?'
-        rf'["\']?{_HERMES_SECURITY_CONFIG_KEY}["\']?(?:\s|$)',
-        _SECURITY_CONFIG_APPROVAL_KEY,
-    ),
-    # The module invocation is a supported alias for the same writer.
-    (
-        rf'\bpython(?:3(?:\.\d+)?)?\s+-m\s+hermes_cli\.main{_HERMES_GLOBAL_FLAGS}'
-        rf'\s+config{_HERMES_PROFILE_FLAGS}\s+(?:set|unset){_HERMES_PROFILE_FLAGS}'
-        rf'\s+(?:--force\s+)?["\']?{_HERMES_SECURITY_CONFIG_KEY}["\']?(?:\s|$)',
-        _SECURITY_CONFIG_APPROVAL_KEY,
-    ),
     # Docker/Podman daemon redirect — global flags or env that point the CLI at a DIFFERENT (often remote) daemon:
     # `docker -H ssh://prod stop app` looks local but operates on remote infra, so any redirect requires approval
     # regardless of subcommand. The flag must be in global position (before the subcommand) and -H/--host/--context
@@ -1388,6 +1361,80 @@ def _command_detection_variants(command: str):
                 yield variant
 
 
+def _security_config_argv_mutation(argv: list[str]) -> bool:
+    """Whether dequoted Hermes argv writes an approval/security config namespace."""
+    without_profiles, index = [], 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--profile", "-p"}:
+            index += 2
+            continue
+        if token.startswith("--profile="):
+            index += 1
+            continue
+        without_profiles.append(token)
+        index += 1
+
+    for index, token in enumerate(without_profiles):
+        if token != "config" or index + 1 >= len(without_profiles):
+            continue
+        if without_profiles[index + 1] not in {"set", "unset"}:
+            continue
+        key_index = index + 2
+        while key_index < len(without_profiles) and without_profiles[key_index] in {"--", "--force"}:
+            key_index += 1
+        if key_index >= len(without_profiles):
+            continue
+        key = without_profiles[key_index]
+        if key == "yolo" or any(
+            key == namespace or key.startswith(namespace + ".")
+            for namespace in ("approvals", "security", "command_allowlist")
+        ):
+            return True
+    return False
+
+
+def _python_hermes_module_argv(tokens: list[str]) -> list[str] | None:
+    """Return argv after ``python -m[ ]hermes_cli.main``, else None."""
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m":
+            if index + 1 < len(tokens) and tokens[index + 1] == "hermes_cli.main":
+                return tokens[index + 2:]
+            return None
+        if token.startswith("-m") and token[2:] == "hermes_cli.main":
+            return tokens[index + 1:]
+        if token == "--" or not token.startswith("-"):
+            return None
+        option = token.split("=", 1)[0]
+        if "=" not in token and option in _INTERPRETER_WITH_ARG["python"]:
+            index += 2
+        else:
+            index += 1
+    return None
+
+
+def _is_hermes_security_config_mutation(command: str) -> bool:
+    """Parse command-position argv so shell quoting cannot hide a config mutation."""
+    for word_start, _, _ in _iter_shell_command_word_spans(command):
+        tokens = _shell_segment_tokens(_shell_command_segment(command, word_start), 0)
+        if not tokens:
+            continue
+        name = os.path.basename(tokens[0]).lower()
+        if name in {"hermes", "hermes.exe"}:
+            argv = tokens[1:]
+        elif _interpreter_family(tokens[0]) == "python":
+            argv = _python_hermes_module_argv(tokens)
+            if argv is None:
+                continue
+        else:
+            continue
+        if _security_config_argv_mutation(argv):
+            return True
+    return False
+
+
 def _is_verification_artifact_cleanup(command: str) -> bool:
     """Return whether *command* only removes one Hermes ad-hoc temp script."""
     try:
@@ -1433,6 +1480,10 @@ def detect_dangerous_command(command: str) -> tuple:
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
     for command_variant in _command_detection_variants(command):
+        if command_variant is None:
+            continue
+        if _is_hermes_security_config_mutation(command_variant):
+            return (True, _SECURITY_CONFIG_APPROVAL_KEY, _SECURITY_CONFIG_APPROVAL_KEY)
         command_lower = command_variant.lower()
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
             if pattern_re.search(command_lower):
