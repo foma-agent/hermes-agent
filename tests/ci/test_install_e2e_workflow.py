@@ -114,6 +114,7 @@ def test_install_e2e_uses_upstream_checkout_without_leaking_credential_or_source
     assert run_step["env"]["HERMES_DEV_SANDBOX_UPSTREAM"] == (
         "${{ runner.temp }}/install-upstream"
     )
+    assert "--install-ref '${{ inputs.install-ref }}'" in run_step["run"]
 
 
 @pytest.mark.parametrize("ref_kind", ["tag", "branch", "sha"])
@@ -169,6 +170,17 @@ def test_dev_sandbox_resolves_distinct_upstream_ref_without_mutating_source(
         install_ref = upstream_tag
         expected_release = upstream_tag
         _git(upstream_checkout, "checkout", "-q", "--detach", install_ref)
+
+    # A resolver must consume the checkout's local objects and refs. Its
+    # persisted remote has no credential in CI and must not become a hidden
+    # network dependency or a chance to re-resolve a moved ref.
+    _git(
+        upstream_checkout,
+        "remote",
+        "set-url",
+        "origin",
+        str(tmp_path / "unreachable-upstream"),
+    )
 
     if ref_kind == "sha":
         source_has_ref = subprocess.run(
