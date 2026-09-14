@@ -23,7 +23,16 @@ def _one_step(steps: list[dict], predicate, description: str) -> dict:
 
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", "-C", str(repo), *args],
+        [
+            "git",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=",
+            "-C",
+            str(repo),
+            *args,
+        ],
         check=True,
         text=True,
         capture_output=True,
@@ -44,6 +53,16 @@ def _commit_installer(repo: Path, body: str, message: str) -> str:
     _git(repo, "add", "scripts/install.sh")
     _git(repo, "commit", "-q", "-m", message)
     return _git(repo, "rev-parse", "HEAD^{commit}")
+
+
+def _source_state(repo: Path) -> tuple[str, str, str, str, bool]:
+    return (
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "for-each-ref", "--format=%(refname) %(objectname)"),
+        _git(repo, "status", "--porcelain=v1", "--untracked-files=all"),
+        _git(repo, "diff", "--cached"),
+        (repo / ".git/FETCH_HEAD").exists(),
+    )
 
 
 def test_install_e2e_uses_upstream_checkout_without_leaking_credential_or_source_state():
@@ -77,6 +96,9 @@ def test_install_e2e_uses_upstream_checkout_without_leaking_credential_or_source
     )
 
     assert source_checkout["with"]["fetch-depth"] == 0
+    assert steps.index(source_checkout) < steps.index(upstream_checkout)
+    assert steps.index(upstream_checkout) < steps.index(move_step)
+    assert steps.index(move_step) < steps.index(run_step)
     upstream_with = upstream_checkout["with"]
     assert upstream_with["repository"] == "NousResearch/hermes-agent"
     assert upstream_with["ref"] == "${{ inputs.install-ref }}"
@@ -101,13 +123,13 @@ def test_dev_sandbox_resolves_distinct_upstream_tag_and_branch_without_mutating_
     source = tmp_path / "source"
     _init_repo(source)
     _commit_installer(source, "source tag decoy", "source tag decoy")
-    _git(source, "tag", "v1")
+    _git(source, "tag", "-a", "v1", "-m", "source release")
     _commit_installer(source, "source branch decoy", "source branch decoy")
 
     upstream_origin = tmp_path / "upstream-origin"
     _init_repo(upstream_origin)
     upstream_tag = _commit_installer(upstream_origin, "upstream tag", "upstream tag")
-    _git(upstream_origin, "tag", "v1")
+    _git(upstream_origin, "tag", "-a", "v1", "-m", "upstream release")
     upstream_branch = _commit_installer(
         upstream_origin,
         "upstream branch",
@@ -141,7 +163,7 @@ def test_dev_sandbox_resolves_distinct_upstream_tag_and_branch_without_mutating_
         expected_release = upstream_branch
 
     assert _git(source, "rev-parse", f"{install_ref}^{{commit}}") != expected_release
-    refs_before = _git(source, "for-each-ref", "--format=%(refname) %(objectname)")
+    source_before = _source_state(source)
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -178,6 +200,4 @@ def test_dev_sandbox_resolves_distinct_upstream_tag_and_branch_without_mutating_
         in completed.stderr
     )
     assert "could not resolve upstream ref" not in completed.stderr
-    assert (
-        _git(source, "for-each-ref", "--format=%(refname) %(objectname)") == refs_before
-    )
+    assert _source_state(source) == source_before
