@@ -31,10 +31,14 @@ def _one_step(steps: list[dict], predicate, description: str) -> dict:
     return matches[0]
 
 
-def _git(repo: Path, *args: str) -> str:
+def _isolated_git_env() -> dict[str, str]:
     env = os.environ.copy()
     for name in _GIT_REPOSITORY_ENV:
         env.pop(name, None)
+    return env
+
+
+def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
         [
             "git",
@@ -51,7 +55,7 @@ def _git(repo: Path, *args: str) -> str:
         check=True,
         text=True,
         capture_output=True,
-        env=env,
+        env=_isolated_git_env(),
     ).stdout.strip()
 
 
@@ -149,6 +153,7 @@ def test_install_e2e_uses_upstream_checkout_without_leaking_credential_or_source
 @pytest.mark.parametrize("ref_kind", ["tag", "branch", "sha"])
 def test_dev_sandbox_resolves_distinct_upstream_ref_without_mutating_source(
     tmp_path: Path,
+    monkeypatch,
     ref_kind: str,
 ):
     """The real resolver uses its upstream checkout, not same-named source refs."""
@@ -212,11 +217,21 @@ def test_dev_sandbox_resolves_distinct_upstream_ref_without_mutating_source(
     )
 
     if ref_kind == "sha":
-        source_has_ref = subprocess.run(
-            ["git", "-C", str(source), "cat-file", "-e", f"{install_ref}^{{commit}}"],
-            capture_output=True,
-            check=False,
-        )
+        with monkeypatch.context() as ambient_git:
+            ambient_git.setenv("GIT_DIR", str(upstream_checkout / ".git"))
+            source_has_ref = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "cat-file",
+                    "-e",
+                    f"{install_ref}^{{commit}}",
+                ],
+                capture_output=True,
+                check=False,
+                env=_isolated_git_env(),
+            )
         assert source_has_ref.returncode != 0
     else:
         assert (
