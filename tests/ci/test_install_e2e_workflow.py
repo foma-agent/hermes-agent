@@ -35,6 +35,11 @@ def _isolated_git_env() -> dict[str, str]:
     env = os.environ.copy()
     for name in _GIT_REPOSITORY_ENV:
         env.pop(name, None)
+    env.update({
+        "GIT_ALLOW_PROTOCOL": "file",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    })
     return env
 
 
@@ -79,6 +84,46 @@ def test_fixture_git_ignores_ambient_repository_selection(tmp_path: Path, monkey
 
     assert (fixture / ".git").is_dir()
     assert _git(decoy, "config", "user.name") == "Decoy"
+
+
+def test_fixture_git_allows_local_remotes_when_ambient_protocol_blocks_file(
+    tmp_path: Path,
+    monkeypatch,
+):
+    origin = tmp_path / "origin"
+    _init_repo(origin)
+    _commit_installer(origin, "origin", "origin")
+
+    checkout = tmp_path / "checkout"
+    _init_repo(checkout)
+    _git(checkout, "remote", "add", "origin", str(origin))
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https")
+
+    _git(checkout, "fetch", "-q", "origin", "main")
+
+    assert _git(checkout, "rev-parse", "FETCH_HEAD") == _git(
+        origin, "rev-parse", "HEAD"
+    )
+
+
+@pytest.mark.parametrize(
+    ("scope", "environment_name"),
+    [("--global", "GIT_CONFIG_GLOBAL"), ("--system", "GIT_CONFIG_SYSTEM")],
+)
+def test_fixture_git_ignores_ambient_config_sources(
+    tmp_path: Path,
+    monkeypatch,
+    scope: str,
+    environment_name: str,
+):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    ambient_config = tmp_path / "ambient.gitconfig"
+    ambient_config.write_text("[fixture]\n\tmarker = ambient\n", encoding="utf-8")
+    monkeypatch.setenv(environment_name, str(ambient_config))
+
+    with pytest.raises(subprocess.CalledProcessError):
+        _git(repo, "config", scope, "fixture.marker")
 
 
 def _commit_installer(repo: Path, body: str, message: str) -> str:
