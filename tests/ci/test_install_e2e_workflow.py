@@ -197,6 +197,10 @@ def test_dev_sandbox_resolves_distinct_upstream_ref_without_mutating_source(
 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    for name in ("bwrap", "slirp4netns"):
+        fake_command = fake_bin / name
+        fake_command.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        fake_command.chmod(0o755)
     fake_unshare = fake_bin / "unshare"
     fake_unshare.write_text("#!/bin/sh\nexit 73\n", encoding="utf-8")
     fake_unshare.chmod(0o755)
