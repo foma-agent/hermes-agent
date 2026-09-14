@@ -28,6 +28,8 @@ def _git(repo: Path, *args: str) -> str:
             "-c",
             "commit.gpgsign=false",
             "-c",
+            "tag.gpgSign=false",
+            "-c",
             "core.hooksPath=",
             "-C",
             str(repo),
@@ -114,10 +116,10 @@ def test_install_e2e_uses_upstream_checkout_without_leaking_credential_or_source
     )
 
 
-@pytest.mark.parametrize("install_ref", ["v1", "refs/heads/main"])
-def test_dev_sandbox_resolves_distinct_upstream_tag_and_branch_without_mutating_source(
+@pytest.mark.parametrize("ref_kind", ["tag", "branch", "sha"])
+def test_dev_sandbox_resolves_distinct_upstream_ref_without_mutating_source(
     tmp_path: Path,
-    install_ref: str,
+    ref_kind: str,
 ):
     """The real resolver uses its upstream checkout, not same-named source refs."""
     source = tmp_path / "source"
@@ -148,10 +150,12 @@ def test_dev_sandbox_resolves_distinct_upstream_tag_and_branch_without_mutating_
         "+refs/heads/*:refs/remotes/origin/*",
         "+refs/tags/*:refs/tags/*",
     )
-    if install_ref == "v1":
+    if ref_kind == "tag":
+        install_ref = "v1"
         _git(upstream_checkout, "checkout", "-q", "--detach", "refs/tags/v1")
         expected_release = upstream_tag
-    else:
+    elif ref_kind == "branch":
+        install_ref = "refs/heads/main"
         _git(
             upstream_checkout,
             "checkout",
@@ -161,8 +165,22 @@ def test_dev_sandbox_resolves_distinct_upstream_tag_and_branch_without_mutating_
             "refs/remotes/origin/main",
         )
         expected_release = upstream_branch
+    else:
+        install_ref = upstream_tag
+        expected_release = upstream_tag
+        _git(upstream_checkout, "checkout", "-q", "--detach", install_ref)
 
-    assert _git(source, "rev-parse", f"{install_ref}^{{commit}}") != expected_release
+    if ref_kind == "sha":
+        source_has_ref = subprocess.run(
+            ["git", "-C", str(source), "cat-file", "-e", f"{install_ref}^{{commit}}"],
+            capture_output=True,
+            check=False,
+        )
+        assert source_has_ref.returncode != 0
+    else:
+        assert (
+            _git(source, "rev-parse", f"{install_ref}^{{commit}}") != expected_release
+        )
     source_before = _source_state(source)
 
     fake_bin = tmp_path / "bin"
