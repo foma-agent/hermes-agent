@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import subprocess
 
@@ -8,6 +9,15 @@ import yaml
 _REPO = Path(__file__).resolve().parents[2]
 _WORKFLOW = _REPO / ".github/workflows/install-e2e-run.yml"
 _SANDBOX = _REPO / "scripts/dev-sandbox.sh"
+_GIT_REPOSITORY_ENV = {
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+}
 
 
 def _steps() -> list[dict]:
@@ -22,6 +32,9 @@ def _one_step(steps: list[dict], predicate, description: str) -> dict:
 
 
 def _git(repo: Path, *args: str) -> str:
+    env = os.environ.copy()
+    for name in _GIT_REPOSITORY_ENV:
+        env.pop(name, None)
     return subprocess.run(
         [
             "git",
@@ -38,6 +51,7 @@ def _git(repo: Path, *args: str) -> str:
         check=True,
         text=True,
         capture_output=True,
+        env=env,
     ).stdout.strip()
 
 
@@ -46,6 +60,21 @@ def _init_repo(path: Path) -> None:
     _git(path, "init", "-q", "-b", "main")
     _git(path, "config", "user.name", "Install E2E test")
     _git(path, "config", "user.email", "install-e2e-test@invalid")
+
+
+def test_fixture_git_ignores_ambient_repository_selection(tmp_path: Path, monkeypatch):
+    decoy = tmp_path / "decoy"
+    _init_repo(decoy)
+    _git(decoy, "config", "user.name", "Decoy")
+
+    fixture = tmp_path / "fixture"
+    fixture.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+
+    _git(fixture, "init", "-q", "-b", "main")
+
+    assert (fixture / ".git").is_dir()
+    assert _git(decoy, "config", "user.name") == "Decoy"
 
 
 def _commit_installer(repo: Path, body: str, message: str) -> str:
