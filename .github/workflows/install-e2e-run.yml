@@ -56,6 +56,19 @@ jobs:
         with:
           fetch-depth: 0
 
+      # A fork's tags and branch refs are not authoritative for upstream releases.
+      # Keep a token-authenticated upstream checkout beside the source under test,
+      # but exclude it so the sandbox does not mistake the nested checkout for a
+      # dirty source tree and manufacture a new update target.
+      - name: Exclude upstream checkout from source snapshot
+        run: printf '/.install-upstream/\n' >> .git/info/exclude
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ inputs.install-ref }}
+          fetch-depth: 0
+          path: .install-upstream
+
       # bubblewrap + slirp4netns are what the sandbox is built on; util-linux
       # supplies the `unshare` that builds the multi-uid userns for the
       # user-level (non-root) install.
@@ -88,10 +101,10 @@ jobs:
             --route '${{ inputs.route }}' \
             --install-ref '${{ inputs.install-ref }}'
         env:
-          # checkout already fetched full history and tags. Let each matrix leg
-          # resolve its starting release from that local repository instead of
-          # fanning out unauthenticated GitHub fetches that can return 429.
-          HERMES_DEV_SANDBOX_UPSTREAM: ${{ github.workspace }}
+          # Resolve against the authenticated upstream checkout. The installer
+          # fetches this local repository into its own temporary repo, preserving
+          # the real branch/tag/SHA resolution path without another network call.
+          HERMES_DEV_SANDBOX_UPSTREAM: ${{ github.workspace }}/.install-upstream
           # Outside the workspace on purpose: the script creates this directory
           # up front, and an untracked dir inside the repo makes the worktree
           # dirty -- which dev-sandbox reacts to by snapshotting the working
