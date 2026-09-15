@@ -351,7 +351,22 @@ def _wait_unreaped(pid: int, timeout: float) -> None:
         finally:
             os.close(pidfd)
     except OSError:
-        return
+        deadline = time.monotonic() + timeout
+        while not _exited_unreaped(pid):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.05, remaining))
+
+
+def _exited_unreaped(pid: int) -> bool:
+    """Observe child exit without releasing its pid for reuse."""
+    try:
+        return (
+            os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+        )
+    except ChildProcessError:
+        return True
 
 
 def _terminate(proc) -> None:
@@ -468,6 +483,13 @@ def _await_lease_end(conn, proc) -> None:
         pidfd = os.pidfd_open(proc.pid)
     except ProcessLookupError:
         return
+    except OSError:
+        with selectors.DefaultSelector() as sel:
+            sel.register(conn, selectors.EVENT_READ)
+            while not _exited_unreaped(proc.pid):
+                if sel.select(0.05) and not conn.recv(_RECV_CHUNK):
+                    return
+        return
     try:
         with selectors.DefaultSelector() as sel:
             sel.register(pidfd, selectors.EVENT_READ)
@@ -574,6 +596,46 @@ def _clear_stale_socket(sock_path: str) -> None:
     os.unlink(sock_path)
 
 
+def _reclaim_stale_publish_dir(path: str) -> bool:
+    """Reclaim only a private slot containing one unreachable broker socket."""
+    try:
+        info = os.lstat(path)
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()  # windows-footgun: ok — Linux-only broker
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or entries != ["s"]
+    ):
+        return False
+    socket_path = os.path.join(path, "s")
+    try:
+        if not stat.S_ISSOCK(os.lstat(socket_path).st_mode):
+            return False
+    except OSError:
+        return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.2)
+    try:
+        probe.connect(socket_path)
+    except (ConnectionRefusedError, FileNotFoundError):
+        pass
+    except OSError:
+        return False
+    else:
+        return False
+    finally:
+        probe.close()
+    try:
+        os.unlink(socket_path)
+        os.rmdir(path)
+    except OSError:
+        return False
+    return True
+
+
 def _unlink_owned_socket(sock_path: str, owned_fd: int) -> None:
     """Unlink *sock_path* only while it still names the socket we bound."""
     try:
@@ -620,10 +682,9 @@ def _start_worker(conn, root: str, handshake_timeout: float, leases: _Leases) ->
         return
     try:
         worker.start()
-    except BaseException:
+    except RuntimeError:
         leases.finished(conn)
         conn.close()
-        raise
 
 
 def serve(
@@ -652,17 +713,18 @@ def serve(
                 try:
                     os.mkdir(candidate, 0o700)
                 except FileExistsError:
-                    continue
+                    if not _reclaim_stale_publish_dir(candidate):
+                        continue
+                    os.mkdir(candidate, 0o700)
                 publish_dir = candidate
                 break
             else:
-                raise OSError(
-                    errno.EEXIST,
+                raise SystemExit(
                     "no compact private socket publication directory was available",
                 )
             os.chmod(publish_dir, 0o700)
             temporary_socket = os.path.join(publish_dir, "s")
-            listener.bind(temporary_socket)
+            listener.bind(f"/proc/self/fd/{lock_fd}/{suffix}/s")
             listener.listen(16)
             os.chmod(temporary_socket, 0o600)
             owned_fd = os.open(

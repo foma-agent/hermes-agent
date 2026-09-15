@@ -33,6 +33,7 @@ import importlib.util
 import json
 import os
 import selectors
+import shutil
 import signal
 import socket
 import stat
@@ -263,10 +264,15 @@ def test_teardown_failure_does_not_strand_lease(monkeypatch, tmp_path):
     runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
     client, conn = socket.socketpair()
     leases = broker._Leases()
-    worker = threading.Thread(
-        target=broker._serve_connection,
-        args=(conn, str(root), HANDSHAKE_TIMEOUT, leases),
-    )
+    thread_errors = []
+
+    def serve():
+        try:
+            broker._serve_connection(conn, str(root), HANDSHAKE_TIMEOUT, leases)
+        except OSError as exc:
+            thread_errors.append(exc)
+
+    worker = threading.Thread(target=serve)
     assert leases.register(conn, worker)
     worker.start()
     client.sendall(_launch_body(runner))
@@ -280,6 +286,7 @@ def test_teardown_failure_does_not_strand_lease(monkeypatch, tmp_path):
             )
             client.close()
             worker.join(DEADLINE)
+        assert len(thread_errors) == 1
         drain = threading.Thread(target=leases.drain, daemon=True)
         drain.start()
         drain.join(DEADLINE)
@@ -382,6 +389,102 @@ def test_broker_launches_when_socket_basename_is_publication_suffix(tmp_path):
             _stop_broker(proc)
         with contextlib.suppress(FileNotFoundError):
             os.rmdir(socket_dir)
+
+
+@pytest.mark.linux_only
+def test_broker_publishes_107_byte_socket_with_one_character_basename(tmp_path):
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
+    path_root = tempfile.mkdtemp(prefix="hbrk-boundary-")
+    socket_dir = os.path.join(
+        path_root,
+        "d" * (107 - len(os.fsencode(path_root)) - len(os.fsencode("/0")) - 1),
+    )
+    os.mkdir(socket_dir)
+    sock_path = os.path.join(socket_dir, "0")
+    assert len(os.fsencode(sock_path)) == 107
+
+    proc = None
+    conn = None
+    try:
+        proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
+        broker = _load_broker()
+        conn, reply = broker.request_launch(
+            sock_path, runner=str(runner), env={}, fds=[]
+        )
+        assert reply["ok"] is True
+    finally:
+        if conn is not None:
+            conn.close()
+        if proc is not None:
+            _stop_broker(proc)
+        with contextlib.suppress(FileNotFoundError):
+            os.rmdir(socket_dir)
+        with contextlib.suppress(FileNotFoundError):
+            os.rmdir(path_root)
+
+
+@pytest.mark.linux_only
+def test_publication_slots_reclaim_only_stale_broker_sockets(tmp_path, request):
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
+    socket_dir = tempfile.mkdtemp(prefix="hbrk-slots-")
+    request.addfinalizer(lambda: shutil.rmtree(socket_dir, ignore_errors=True))
+    live_dir = os.path.join(socket_dir, broker._PUBLISH_SUFFIXES[0])
+    unrelated_dir = os.path.join(socket_dir, broker._PUBLISH_SUFFIXES[1])
+    os.mkdir(live_dir, 0o700)
+    os.mkdir(unrelated_dir, 0o700)
+    live = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    live.bind(os.path.join(live_dir, "s"))
+    live.listen(1)
+    unrelated = Path(unrelated_dir) / "keep"
+    unrelated.write_text("not broker state\n", encoding="utf-8")
+    for suffix in broker._PUBLISH_SUFFIXES[2:]:
+        candidate = os.path.join(socket_dir, suffix)
+        os.mkdir(candidate, 0o700)
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(os.path.join(candidate, "s"))
+        stale.close()
+
+    proc = None
+    conn = None
+    sock_path = os.path.join(socket_dir, "broker.sock")
+    try:
+        proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
+        conn, reply = broker.request_launch(
+            sock_path, runner=str(runner), env={}, fds=[]
+        )
+        assert reply["ok"] is True
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(os.path.join(live_dir, "s"))
+        finally:
+            probe.close()
+        assert unrelated.read_text(encoding="utf-8") == "not broker state\n"
+    finally:
+        if conn is not None:
+            conn.close()
+        if proc is not None:
+            _stop_broker(proc)
+        live.close()
+
+    exhausted_dir = tempfile.mkdtemp(prefix="hbrk-exhausted-")
+    request.addfinalizer(lambda: shutil.rmtree(exhausted_dir, ignore_errors=True))
+    for suffix in broker._PUBLISH_SUFFIXES:
+        candidate = Path(exhausted_dir) / suffix
+        candidate.mkdir(mode=0o700)
+        (candidate / "keep").write_text("unrelated\n", encoding="utf-8")
+    refused, _ = _start_broker(
+        "host-only-secret",
+        root,
+        sock_path=os.path.join(exhausted_dir, "broker.sock"),
+        expect_ready=False,
+    )
+    assert refused.wait(timeout=DEADLINE) != 0
+    diagnostic = refused.stderr.read()
+    assert "no compact private socket publication directory was available" in diagnostic
+    assert "Traceback" not in diagnostic
 
 
 @pytest.mark.linux_only
@@ -1234,10 +1337,7 @@ def test_shutdown_waits_for_a_worker_spawning_before_process_registration(
 
         monkeypatch.setattr(broker.threading, "Thread", FailingThread)
         failed_leases = broker._Leases()
-        with pytest.raises(RuntimeError, match="thread start failed"):
-            broker._start_worker(
-                failed_conn, str(root), HANDSHAKE_TIMEOUT, failed_leases
-            )
+        broker._start_worker(failed_conn, str(root), HANDSHAKE_TIMEOUT, failed_leases)
         failed_client.settimeout(DEADLINE)
         assert failed_client.recv(1) == b""
         failed_leases.drain()
@@ -1253,3 +1353,116 @@ def test_shutdown_waits_for_a_worker_spawning_before_process_registration(
                 child_pid,
                 signal.SIGKILL,  # windows-footgun: ok — linux_only test
             )
+
+
+@pytest.mark.linux_only
+def test_thread_start_failure_rejects_only_that_connection(tmp_path, monkeypatch):
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
+    leases = broker._Leases()
+    live_client, live_conn = socket.socketpair()
+    rejected_client, rejected_conn = socket.socketpair()
+    later_client, later_conn = socket.socketpair()
+    real_thread = threading.Thread
+
+    broker._start_worker(live_conn, str(root), HANDSHAKE_TIMEOUT, leases)
+    live_client.sendall(_launch_body(runner))
+    live_reply = json.loads(live_client.recv(4096).split(b"\n", 1)[0])
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread start failed")
+
+    try:
+        monkeypatch.setattr(broker.threading, "Thread", FailingThread)
+        broker._start_worker(rejected_conn, str(root), HANDSHAKE_TIMEOUT, leases)
+        rejected_client.settimeout(DEADLINE)
+        assert rejected_client.recv(1) == b""
+        assert _pid_running(live_reply["pid"]), (
+            "a rejected worker drained an unrelated live lease"
+        )
+
+        monkeypatch.setattr(broker.threading, "Thread", real_thread)
+        broker._start_worker(later_conn, str(root), HANDSHAKE_TIMEOUT, leases)
+        later_client.sendall(_launch_body(runner))
+        later_reply = json.loads(later_client.recv(4096).split(b"\n", 1)[0])
+        assert later_reply["ok"] is True
+        assert _pid_running(later_reply["pid"])
+    finally:
+        live_client.close()
+        rejected_client.close()
+        later_client.close()
+        leases.drain()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("pidfd_errno", [errno.EMFILE, errno.ENOSYS])
+def test_pidfd_failure_keeps_live_client_lease_open(monkeypatch, pidfd_errno):
+    broker = _load_broker()
+    client, conn = socket.socketpair()
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    waiter = threading.Thread(target=broker._await_lease_end, args=(conn, proc))
+    monkeypatch.setattr(
+        broker.os,
+        "pidfd_open",
+        lambda _pid: (_ for _ in ()).throw(OSError(pidfd_errno, "injected")),
+    )
+    try:
+        waiter.start()
+        waiter.join(0.2)
+        assert waiter.is_alive(), "pidfd failure was mistaken for child exit"
+        assert proc.poll() is None
+        client.close()
+        waiter.join(DEADLINE)
+        assert not waiter.is_alive(), "connection EOF did not end the fallback wait"
+    finally:
+        client.close()
+        conn.close()
+        proc.kill()
+        proc.wait(timeout=DEADLINE)
+
+
+@pytest.mark.linux_only
+def test_pidfd_enosys_preserves_sigterm_grace(monkeypatch):
+    broker = _load_broker()
+    read_fd, write_fd = os.pipe()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                f"""
+                import os, signal, time
+                def stop(_signum, _frame):
+                    os.write({write_fd}, b"term\\n")
+                    time.sleep(0.2)
+                    os.write({write_fd}, b"done\\n")
+                    raise SystemExit(0)
+                signal.signal(signal.SIGTERM, stop)
+                os.write({write_fd}, b"ready\\n")
+                time.sleep(600)
+                """
+            ),
+        ],
+        pass_fds=(write_fd,),
+        start_new_session=True,
+    )
+    os.close(write_fd)
+    monkeypatch.setattr(
+        broker.os,
+        "pidfd_open",
+        lambda _pid: (_ for _ in ()).throw(OSError(errno.ENOSYS, "injected")),
+    )
+    try:
+        assert _read_with_deadline(read_fd, until_eof=False) == b"ready"
+        broker._terminate(proc)
+        assert _read_with_deadline(read_fd, until_eof=True) == b"term\ndone\n"
+    finally:
+        os.close(read_fd)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=DEADLINE)
