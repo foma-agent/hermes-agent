@@ -80,6 +80,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -263,6 +264,8 @@ def _validated(request):
     runner = request.get("runner")
     if not isinstance(runner, str) or not runner:
         raise BrokerError("bad_request", "'runner' must be a non-empty string")
+    if "\0" in runner:
+        raise BrokerError("bad_request", "'runner' must not contain NUL")
     if "env" not in request:
         env = {}
     else:
@@ -340,14 +343,14 @@ def _wait_unreaped(pid: int, timeout: float) -> None:
     """
     try:
         pidfd = os.pidfd_open(pid)
-    except ProcessLookupError:
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(pidfd, selectors.EVENT_READ)
+                sel.select(timeout)
+        finally:
+            os.close(pidfd)
+    except OSError:
         return
-    try:
-        with selectors.DefaultSelector() as sel:
-            sel.register(pidfd, selectors.EVENT_READ)
-            sel.select(timeout)
-    finally:
-        os.close(pidfd)
 
 
 def _terminate(proc) -> None:
@@ -514,9 +517,11 @@ def _serve_connection(
     finally:
         with contextlib.suppress(OSError):
             conn.close()
-        if proc is not None and leases.claim(conn, proc):
-            _terminate(proc)
-        leases.finished(conn)
+        try:
+            if proc is not None and leases.claim(conn, proc):
+                _terminate(proc)
+        finally:
+            leases.finished(conn)
 
 
 def _validated_staging_root(path: str) -> str:
@@ -626,16 +631,27 @@ def serve(
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     leases = _Leases()
     owned_identity = None
+    publish_dir = None
+    temporary_socket = None
     try:
         socket_dir = os.path.dirname(sock_path) or "."
         lock_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             _clear_stale_socket(sock_path)
-            listener.bind(sock_path)
-            owned_identity = _socket_identity(sock_path)
-            os.chmod(sock_path, 0o600)
+            publish_dir = tempfile.mkdtemp(prefix=".hermes-broker-", dir=socket_dir)
+            os.chmod(publish_dir, 0o700)
+            temporary_socket = os.path.join(publish_dir, "socket")
+            listener.bind(temporary_socket)
             listener.listen(16)
+            os.chmod(temporary_socket, 0o600)
+            temporary_identity = _socket_identity(temporary_socket)
+            os.link(temporary_socket, sock_path)
+            owned_identity = temporary_identity
+            os.unlink(temporary_socket)
+            temporary_socket = None
+            os.rmdir(publish_dir)
+            publish_dir = None
         finally:
             os.close(lock_fd)
         _install_shutdown(listener)
@@ -655,6 +671,12 @@ def serve(
         if owned_identity is not None:
             with contextlib.suppress(OSError):
                 _unlink_owned_socket(sock_path, owned_identity)
+        if temporary_socket is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary_socket)
+        if publish_dir is not None:
+            with contextlib.suppress(OSError):
+                os.rmdir(publish_dir)
 
 
 def main(argv=None) -> int:

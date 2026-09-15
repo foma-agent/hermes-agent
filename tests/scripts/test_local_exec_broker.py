@@ -33,6 +33,7 @@ import os
 import selectors
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -254,6 +255,72 @@ def _sendmsg_all(conn, body: bytes, ancillary) -> None:
 
 
 @pytest.mark.linux_only
+def test_teardown_failure_does_not_strand_lease(monkeypatch, tmp_path):
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
+    client, conn = socket.socketpair()
+    leases = broker._Leases()
+    worker = threading.Thread(
+        target=broker._serve_connection,
+        args=(conn, str(root), HANDSHAKE_TIMEOUT, leases),
+    )
+    assert leases.register(conn, worker)
+    worker.start()
+    client.sendall(_launch_body(runner))
+    reply = json.loads(client.recv(4096).split(b"\n", 1)[0])
+    assert reply["ok"] is True
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                broker, "_terminate", lambda _proc: (_ for _ in ()).throw(OSError())
+            )
+            client.close()
+            worker.join(DEADLINE)
+        drain = threading.Thread(target=leases.drain, daemon=True)
+        drain.start()
+        drain.join(DEADLINE)
+        assert not drain.is_alive(), (
+            "teardown failure stranded the lease registry entry"
+        )
+
+        monkeypatch.setattr(
+            broker.os, "pidfd_open", lambda _pid: (_ for _ in ()).throw(OSError())
+        )
+        broker._wait_unreaped(reply["pid"], 0)
+    finally:
+        broker._signal_group(
+            reply["pid"],
+            signal.SIGKILL,  # windows-footgun: ok — linux_only test
+        )
+        with contextlib.suppress(ChildProcessError, ProcessLookupError):
+            os.waitpid(reply["pid"], 0)
+
+
+@pytest.mark.linux_only
+def test_socket_is_private_when_first_published(monkeypatch, tmp_path):
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    sock_path = _socket_path()
+    published_modes = []
+    real_link = os.link
+
+    def observe_link(source, target):
+        assert target == sock_path
+        assert stat.S_IMODE(os.lstat(source).st_mode) == 0o600
+        real_link(source, target)
+        published_modes.append(stat.S_IMODE(os.lstat(target).st_mode))
+
+    monkeypatch.setattr(broker.os, "link", observe_link)
+    monkeypatch.setattr(broker, "_install_shutdown", lambda listener: listener.close())
+
+    broker.serve(sock_path, str(root))
+
+    assert published_modes == [0o600]
+
+
+@pytest.mark.linux_only
 def test_broker_transports_approved_resources_and_refuses_invalid_requests_without_leaking_fds(
     tmp_path,
 ):
@@ -386,6 +453,13 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
             (
                 "environment that is not an object",
                 json.dumps({"op": "launch", "runner": str(runner), "env": []}).encode()
+                + b"\n",
+                1,
+                "bad_request",
+            ),
+            (
+                "runner containing NUL",
+                json.dumps({"op": "launch", "runner": "/x/a\0b", "env": {}}).encode()
                 + b"\n",
                 1,
                 "bad_request",
@@ -547,7 +621,7 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
             expect_ready=False,
         )
         try:
-            assert duplicate.wait(timeout=HANDSHAKE_TIMEOUT) != 0, (
+            assert duplicate.wait(timeout=DEADLINE) != 0, (
                 "a second broker replaced the live broker's socket"
             )
         finally:
@@ -759,12 +833,18 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
         )
 
         shared_root = tmp_path / "shared-staging"
-        shared_root.mkdir(mode=0o750)
+        shared_root.mkdir()
+        os.chmod(shared_root, 0o750)
+        assert stat.S_IMODE(shared_root.stat().st_mode) == 0o750
         refused_root, refused_path = _start_broker(
             "host-only-secret", shared_root, expect_ready=False
         )
-        assert refused_root.wait(timeout=DEADLINE) != 0
-        assert not os.path.exists(refused_path)
+        try:
+            assert refused_root.wait(timeout=DEADLINE) != 0
+            assert not os.path.exists(refused_path)
+        finally:
+            if refused_root.poll() is None:
+                _stop_broker(refused_root)
 
         # Teardown has exactly one owner, including a child spawned while shutdown is
         # taking its registry snapshot. A late registration is handed back to its worker;
