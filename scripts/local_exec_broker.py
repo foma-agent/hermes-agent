@@ -81,7 +81,6 @@ import socket
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -97,6 +96,7 @@ _INT_SIZE = array.array("i").itemsize
 _RECV_CHUNK = 4096
 _TERM_GRACE_SECONDS = 2.0
 _KILL_GRACE_SECONDS = 2.0
+_PUBLISH_SUFFIXES = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 class BrokerError(RuntimeError):
@@ -246,7 +246,7 @@ def _recv_request(conn, fds: list, handshake_timeout: float):
             )
     try:
         request = json.loads(buf.split(b"\n", 1)[0])
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise BrokerError("bad_request", f"request was not JSON: {exc}") from exc
     return _validated(request)
 
@@ -646,9 +646,21 @@ def serve(
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             _clear_stale_socket(sock_path)
-            publish_dir = tempfile.mkdtemp(prefix=".hermes-broker-", dir=socket_dir)
+            for suffix in _PUBLISH_SUFFIXES:
+                candidate = os.path.join(socket_dir, suffix)
+                try:
+                    os.mkdir(candidate, 0o700)
+                except FileExistsError:
+                    continue
+                publish_dir = candidate
+                break
+            else:
+                raise OSError(
+                    errno.EEXIST,
+                    "no compact private socket publication directory was available",
+                )
             os.chmod(publish_dir, 0o700)
-            temporary_socket = os.path.join(publish_dir, "socket")
+            temporary_socket = os.path.join(publish_dir, "s")
             listener.bind(temporary_socket)
             listener.listen(16)
             os.chmod(temporary_socket, 0o600)

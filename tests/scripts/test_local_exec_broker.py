@@ -323,6 +323,43 @@ def test_socket_is_private_when_first_published(monkeypatch, tmp_path):
 
 
 @pytest.mark.linux_only
+def test_broker_launches_from_long_socket_directory(tmp_path):
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
+    path_root = tempfile.mkdtemp(prefix="hbrk-long-")
+    socket_dir = os.path.join(
+        path_root,
+        "d" * (107 - len(os.fsencode(path_root)) - len(os.fsencode("/b.sock")) - 1),
+    )
+    os.mkdir(socket_dir)
+    sock_path = os.path.join(socket_dir, "b.sock")
+    assert len(os.fsencode(sock_path)) == 107
+    assert (
+        len(os.fsencode(os.path.join(socket_dir, ".hermes-broker-XXXXXXXX", "socket")))
+        > 107
+    )
+
+    proc = None
+    conn = None
+    try:
+        proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
+        broker = _load_broker()
+        conn, reply = broker.request_launch(
+            sock_path, runner=str(runner), env={}, fds=[]
+        )
+        assert reply["ok"] is True
+    finally:
+        if conn is not None:
+            conn.close()
+        if proc is not None:
+            _stop_broker(proc)
+        with contextlib.suppress(FileNotFoundError):
+            os.rmdir(socket_dir)
+        with contextlib.suppress(FileNotFoundError):
+            os.rmdir(path_root)
+
+
+@pytest.mark.linux_only
 def test_fifo_runner_is_refused_without_blocking_shutdown(tmp_path):
     root = _staging_root(tmp_path)
     fifo = root / "runner.py"
@@ -629,6 +666,13 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
                 "launch_failed",
             ),
             ("body that is not JSON", b"{definitely not json\n", 1, "bad_request"),
+            ("body with invalid UTF-8", b"\xff\xff\xff\xff\n", 1, "bad_request"),
+            (
+                "deeply nested body",
+                b"[" * 30000 + b"\n",
+                1,
+                "bad_request",
+            ),
             (
                 "body that is not a launch request",
                 b'{"op": "nope"}\n',
@@ -742,6 +786,7 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
         assert excinfo.value.code == "runner_outside_root"
     finally:
         _stop_broker(proc)
+        assert "Traceback" not in proc.stderr.read()
 
 
 @pytest.mark.linux_only
