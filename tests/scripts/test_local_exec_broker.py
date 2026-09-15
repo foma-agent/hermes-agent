@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import array
 import contextlib
+import errno
+import fcntl
 import importlib.util
 import json
 import os
@@ -318,6 +320,189 @@ def test_socket_is_private_when_first_published(monkeypatch, tmp_path):
     broker.serve(sock_path, str(root))
 
     assert published_modes == [0o600]
+
+
+@pytest.mark.linux_only
+def test_fifo_runner_is_refused_without_blocking_shutdown(tmp_path):
+    root = _staging_root(tmp_path)
+    fifo = root / "runner.py"
+    os.mkfifo(fifo)
+    proc, sock_path = _start_broker("host-only-secret", root)
+    read_fd, write_fd = os.pipe()
+    try:
+        reply = _raw_request(sock_path, _launch_body(fifo), [write_fd])
+        os.close(write_fd)
+        write_fd = -1
+        assert reply == {
+            "ok": False,
+            "error": "runner_not_regular",
+            "message": "runner is not a regular file",
+        }
+        assert _read_with_deadline(read_fd, until_eof=True) == b""
+
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=DEADLINE) == 0
+        assert not os.path.exists(sock_path)
+    finally:
+        os.close(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=DEADLINE)
+
+
+@pytest.mark.linux_only
+def test_transient_accept_failure_preserves_live_lease(monkeypatch, tmp_path):
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
+    sock_path = _socket_path()
+    real_socket = socket.socket
+    retry_accept = threading.Event()
+    release_failure = threading.Event()
+    finish_accept = threading.Event()
+    listener_box = []
+
+    class OneEmfileSocket(real_socket):
+        accept_calls = 0
+
+        def listen(self, backlog):
+            listener_box.append(self)
+            return super().listen(backlog)
+
+        def accept(self):
+            type(self).accept_calls += 1
+            if type(self).accept_calls == 2:
+                assert release_failure.wait(DEADLINE)
+                raise OSError(errno.EMFILE, "injected descriptor exhaustion")
+            if type(self).accept_calls == 3:
+                retry_accept.set()
+                assert finish_accept.wait(DEADLINE)
+                raise OSError(errno.EBADF, "listener closed by test")
+            return super().accept()
+
+    monkeypatch.setattr(broker.socket, "socket", OneEmfileSocket)
+    monkeypatch.setattr(broker, "_install_shutdown", lambda _listener: None)
+    server = threading.Thread(
+        target=broker.serve, args=(sock_path, str(root)), daemon=True
+    )
+    server.start()
+    deadline = time.monotonic() + DEADLINE
+    while not os.path.exists(sock_path) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert os.path.exists(sock_path), "broker never published its socket"
+
+    conn = None
+    child_pid = None
+    try:
+        conn, reply = broker.request_launch(
+            sock_path, runner=str(runner), env={}, fds=[]
+        )
+        child_pid = reply["pid"]
+        assert _pid_running(child_pid)
+        release_failure.set()
+        assert retry_accept.wait(DEADLINE), "serve stopped after a transient EMFILE"
+        assert server.is_alive()
+        assert _pid_running(child_pid), "transient accept failure drained a live lease"
+    finally:
+        release_failure.set()
+        if conn is not None:
+            conn.close()
+        if listener_box:
+            listener_box[0].close()
+        finish_accept.set()
+        server.join(DEADLINE)
+        assert not server.is_alive(), "serve did not stop after its listener closed"
+        if child_pid is not None and _pid_running(child_pid):
+            os.kill(child_pid, signal.SIGKILL)  # windows-footgun: ok — linux_only test
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(sock_path)
+        with contextlib.suppress(OSError):
+            os.rmdir(os.path.dirname(sock_path))
+
+
+@pytest.mark.linux_only
+def test_shutdown_cleanup_cannot_unlink_replacement_socket(monkeypatch):
+    broker = _load_broker()
+    sock_path = _socket_path()
+    socket_dir = os.path.dirname(sock_path)
+    temporary_path = os.path.join(socket_dir, "replacement.sock")
+    first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    first.bind(sock_path)
+    owned_identity = broker._socket_identity(sock_path)
+    publisher_holds_lock = threading.Event()
+    publish_replacement = threading.Event()
+    replacement_published = threading.Event()
+    thread_errors = []
+    real_flock = fcntl.flock
+    real_socket_identity = broker._socket_identity
+
+    def coordinated_identity(path):
+        identity = real_socket_identity(path)
+        if threading.current_thread().name == "cleanup":
+            publish_replacement.set()
+            assert replacement_published.wait(DEADLINE)
+        return identity
+
+    def coordinated_flock(fd, operation):
+        if threading.current_thread().name == "cleanup":
+            publish_replacement.set()
+        return real_flock(fd, operation)
+
+    def publish():
+        lock_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            real_flock(lock_fd, fcntl.LOCK_EX)
+            publisher_holds_lock.set()
+            assert publish_replacement.wait(DEADLINE)
+            os.unlink(sock_path)
+            replacement.bind(temporary_path)
+            replacement.listen(1)
+            os.link(temporary_path, sock_path)
+            os.unlink(temporary_path)
+            replacement_published.set()
+        except BaseException as exc:
+            thread_errors.append(exc)
+            replacement_published.set()
+        finally:
+            os.close(lock_fd)
+
+    publisher = threading.Thread(target=publish, name="publisher")
+    cleanup = threading.Thread(
+        target=broker._unlink_owned_socket,
+        args=(sock_path, owned_identity),
+        name="cleanup",
+    )
+    monkeypatch.setattr(broker, "_socket_identity", coordinated_identity)
+    monkeypatch.setattr(broker.fcntl, "flock", coordinated_flock)
+    publisher.start()
+    assert publisher_holds_lock.wait(DEADLINE)
+    cleanup.start()
+    try:
+        publisher.join(DEADLINE)
+        cleanup.join(DEADLINE)
+        assert not publisher.is_alive() and not cleanup.is_alive()
+        assert not thread_errors
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(sock_path)
+        finally:
+            probe.close()
+    finally:
+        publish_replacement.set()
+        replacement_published.set()
+        publisher.join(DEADLINE)
+        cleanup.join(DEADLINE)
+        first.close()
+        replacement.close()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_path)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(sock_path)
+        with contextlib.suppress(OSError):
+            os.rmdir(socket_dir)
 
 
 @pytest.mark.linux_only

@@ -71,6 +71,7 @@ from __future__ import annotations
 import argparse
 import array
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -299,7 +300,7 @@ def _resolve_runner(staging_root: str, runner: str) -> str:
 
 def _open_runner(path: str) -> int:
     """Open the staged runner. ``O_NOFOLLOW`` closes the realpath-then-open swap window."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise BrokerError("runner_not_regular", "runner is not a regular file")
@@ -580,12 +581,18 @@ def _socket_identity(sock_path: str) -> tuple[int, int]:
 
 def _unlink_owned_socket(sock_path: str, identity: tuple[int, int]) -> None:
     """Unlink *sock_path* only while it still names the socket we bound."""
+    socket_dir = os.path.dirname(sock_path) or "."
+    lock_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        current = _socket_identity(sock_path)
-    except FileNotFoundError:
-        return
-    if current == identity:
-        os.unlink(sock_path)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            current = _socket_identity(sock_path)
+        except FileNotFoundError:
+            return
+        if current == identity:
+            os.unlink(sock_path)
+    finally:
+        os.close(lock_fd)
 
 
 def _install_shutdown(listener) -> None:
@@ -659,8 +666,15 @@ def serve(
         while True:
             try:
                 conn, _addr = listener.accept()
-            except OSError:
-                break  # the shutdown handler closed the listener
+            except OSError as exc:
+                if listener.fileno() == -1:
+                    break  # the shutdown handler closed the listener
+                if exc.errno == errno.ECONNABORTED:
+                    continue
+                if exc.errno in (errno.EMFILE, errno.ENFILE):
+                    time.sleep(0.05)
+                    continue
+                raise
             _start_worker(conn, root, handshake_timeout, leases)
     finally:
         with contextlib.suppress(OSError):
