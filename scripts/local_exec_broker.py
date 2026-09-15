@@ -42,7 +42,10 @@ retained copy is not merely a leaked fd: it is the peer's channel, and it keeps 
 from ever reaching EOF.
 
 Prototype trust boundary, stated so it is not mistaken for the finished one: the socket is
-0600 and the peer is therefore the broker's OWN uid. The client's ``env`` payload is passed
+0600, the staging root must be owned by the broker uid with mode 0700, and the peer is
+therefore the broker's OWN uid. That broker-exclusive immutable-root contract is what makes
+the resolve-then-``O_NOFOLLOW`` runner open valid in this prototype; a less-trusted peer will
+require descriptor-rooted component walking. The client's ``env`` payload is passed
 to the child verbatim because at this boundary it IS the approved child environment — the
 same dict ``code_kernel._spawn`` builds today. The staging-root containment above is what
 must hold *before* that boundary moves; when the peer becomes a lower-privileged uid, this
@@ -68,6 +71,7 @@ from __future__ import annotations
 import argparse
 import array
 import contextlib
+import fcntl
 import json
 import os
 import selectors
@@ -77,6 +81,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 
 # Child-visible fd numbers the broker forwarded on its behalf, comma separated.
 FDS_ENV = "HERMES_BROKER_FDS"
@@ -124,7 +129,7 @@ def request_launch(
             json.dumps({"op": "launch", "runner": runner, "env": env}).encode("utf-8")
             + b"\n"
         )
-        conn.sendmsg([body], _ancillary(fds))
+        _sendmsg_all(conn, body, _ancillary(fds))
         reply = _read_reply(conn)
         if not reply.get("ok"):
             raise BrokerError(
@@ -143,6 +148,18 @@ def _ancillary(fds):
         if fds
         else []
     )
+
+
+def _sendmsg_all(conn, body: bytes, ancillary) -> None:
+    """Send a complete frame, attaching descriptor rights to its first bytes only."""
+    sent = 0
+    first = True
+    while sent < len(body):
+        written = conn.sendmsg([body[sent:]], ancillary if first else [])
+        if written <= 0:
+            raise ConnectionError("sendmsg made no progress")
+        sent += written
+        first = False
 
 
 def _read_reply(conn) -> dict:
@@ -169,7 +186,7 @@ def _close_all(fds) -> None:
             os.close(fds.pop())
 
 
-def _recv_request(conn, fds: list):
+def _recv_request(conn, fds: list, handshake_timeout: float):
     """Read one bounded request frame, appending every received descriptor to *fds*.
 
     *fds* is the CALLER's list on purpose. The kernel installs descriptors into this process
@@ -178,8 +195,13 @@ def _recv_request(conn, fds: list):
     path out of here.
     """
     buf = b""
+    deadline = time.monotonic() + handshake_timeout
     while b"\n" not in buf:
         try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            conn.settimeout(remaining)
             msg, ancdata, flags, _addr = conn.recvmsg(
                 _RECV_CHUNK, socket.CMSG_SPACE(MAX_FDS * _INT_SIZE)
             )
@@ -336,51 +358,92 @@ def _terminate(proc) -> None:
     contract, not cleanup: an unreaped child is still a ``/proc`` entry that answers
     ``kill(pid, 0)``, i.e. indistinguishable from one that outlived its lease.
     """
-    if proc.returncode is not None:
-        return  # already torn down by the other path (shutdown drain vs. worker unwind)
-    _signal_group(proc.pid, signal.SIGTERM)
-    _wait_unreaped(proc.pid, _TERM_GRACE_SECONDS)
+    _terminate_many([proc])
+
+
+def _terminate_many(procs) -> None:
+    """Broadcast teardown phases to *procs* under shared grace deadlines."""
+    procs = [proc for proc in procs if proc.returncode is None]
+    for proc in procs:
+        _signal_group(proc.pid, signal.SIGTERM)
+    term_deadline = time.monotonic() + _TERM_GRACE_SECONDS
+    for proc in procs:
+        _wait_unreaped(proc.pid, max(0.0, term_deadline - time.monotonic()))
     # The leader is still unreaped, so its pid — and with it the pgid — cannot have been
     # recycled. This is the only safe moment to sweep descendants that outlived the leader or
     # ignored the SIGTERM; they are not our children, so we signal them and let init reap.
-    _signal_group(
-        proc.pid,
-        signal.SIGKILL,  # windows-footgun: ok — Linux-only broker
-    )
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        # Bounded on purpose. A child wedged in uninterruptible sleep (a stalled NFS or FUSE
-        # read) does not die until its syscall returns, and by here the connection is already
-        # closed — there is no channel left to nudge this thread on, so an unbounded wait
-        # would pin a worker for the life of the broker.
-        proc.wait(timeout=_KILL_GRACE_SECONDS)
+    for proc in procs:
+        _signal_group(
+            proc.pid,
+            signal.SIGKILL,  # windows-footgun: ok — Linux-only broker
+        )
+    kill_deadline = time.monotonic() + _KILL_GRACE_SECONDS
+    for proc in procs:
+        try:
+            proc.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            # Keep the Popen object (and therefore waitpid ownership) alive until the
+            # uninterruptible syscall returns and SIGKILL can complete.
+            threading.Thread(target=proc.wait, daemon=True).start()
 
 
 class _Leases:
-    """Every child currently under a lease, so shutdown can tear them down.
+    """Every accepted connection, worker and child, so shutdown can drain all three.
 
-    Worker threads are daemons, so at interpreter exit their ``finally`` blocks never run.
-    Without this registry a SIGTERM leaves every leased child orphaned — reparented to init,
-    detached from the broker's session by ``start_new_session``, still holding descriptors its
-    client has already dropped. That is exactly the state ``_terminate`` exists to prevent.
+    Registration precedes ``Thread.start`` so even a worker blocked inside ``Popen`` remains
+    visible to shutdown. Closing every accepted connection breaks incomplete handshakes;
+    waiting for the registry to empty covers children spawned after the initial snapshot.
     """
 
     def __init__(self):
-        self._lock = threading.Lock()
-        self._procs = set()
+        self._condition = threading.Condition()
+        self._workers = {}
+        self._shutting_down = False
 
-    def add(self, proc) -> None:
-        with self._lock:
-            self._procs.add(proc)
+    def register(self, conn, worker) -> bool:
+        with self._condition:
+            if self._shutting_down:
+                return False
+            self._workers[conn] = [worker, None]
+            return True
 
-    def discard(self, proc) -> None:
-        with self._lock:
-            self._procs.discard(proc)
+    def add(self, conn, proc) -> bool:
+        with self._condition:
+            entry = self._workers.get(conn)
+            if self._shutting_down or entry is None:
+                return False
+            entry[1] = proc
+            return True
+
+    def claim(self, conn, proc) -> bool:
+        with self._condition:
+            entry = self._workers.get(conn)
+            if entry is None or entry[1] is not proc:
+                return False
+            entry[1] = None
+            return True
+
+    def finished(self, conn) -> None:
+        with self._condition:
+            self._workers.pop(conn, None)
+            self._condition.notify_all()
 
     def drain(self) -> None:
-        with self._lock:
-            procs, self._procs = list(self._procs), set()
-        for proc in procs:
-            _terminate(proc)
+        with self._condition:
+            self._shutting_down = True
+            entries = list(self._workers.items())
+            procs = []
+            for _conn, entry in entries:
+                if entry[1] is not None:
+                    procs.append(entry[1])
+                    entry[1] = None
+        for conn, _entry in entries:
+            with contextlib.suppress(OSError):
+                conn.shutdown(socket.SHUT_RDWR)
+        _terminate_many(procs)
+        with self._condition:
+            while self._workers:
+                self._condition.wait()
 
 
 def _reply(conn, payload: dict) -> None:
@@ -421,8 +484,7 @@ def _serve_connection(
     fds: list = []
     try:
         try:
-            conn.settimeout(handshake_timeout)
-            runner, env = _recv_request(conn, fds)
+            runner, env = _recv_request(conn, fds, handshake_timeout)
             runner_fd = _open_runner(_resolve_runner(staging_root, runner))
             proc = _launch(runner_fd, env, fds)
         except BrokerError as exc:
@@ -439,7 +501,10 @@ def _serve_connection(
                 os.close(runner_fd)
         # Registered BEFORE the reply: a SIGTERM racing the handshake must still find this
         # child, or it is orphaned in the one window where nobody is watching it.
-        leases.add(proc)
+        registered = leases.add(conn, proc)
+        if not registered:
+            _terminate(proc)
+            return
         _reply(conn, {"ok": True, "pid": proc.pid})
         # The connection IS the child's lease. A clean close, a crashed client or a SIGKILLed
         # one all surface the same way, which is exactly the signal the inherited
@@ -449,15 +514,22 @@ def _serve_connection(
     finally:
         with contextlib.suppress(OSError):
             conn.close()
-        if proc is not None:
+        if proc is not None and leases.claim(conn, proc):
             _terminate(proc)
-            leases.discard(proc)
+        leases.finished(conn)
 
 
 def _validated_staging_root(path: str) -> str:
     root = os.path.realpath(path)
     if not os.path.isdir(root):
         raise SystemExit(f"staging root is not a directory: {path}")
+    info = os.stat(root)
+    broker_uid = os.geteuid()  # windows-footgun: ok — Linux-only broker
+    if info.st_uid != broker_uid or stat.S_IMODE(info.st_mode) != 0o700:
+        raise SystemExit(
+            "staging root must be owned by the broker uid with permissions 0700: "
+            f"{path}"
+        )
     return root
 
 
@@ -496,6 +568,21 @@ def _clear_stale_socket(sock_path: str) -> None:
     os.unlink(sock_path)
 
 
+def _socket_identity(sock_path: str) -> tuple[int, int]:
+    info = os.lstat(sock_path)
+    return info.st_dev, info.st_ino
+
+
+def _unlink_owned_socket(sock_path: str, identity: tuple[int, int]) -> None:
+    """Unlink *sock_path* only while it still names the socket we bound."""
+    try:
+        current = _socket_identity(sock_path)
+    except FileNotFoundError:
+        return
+    if current == identity:
+        os.unlink(sock_path)
+
+
 def _install_shutdown(listener) -> None:
     """Turn SIGTERM/SIGINT into an ordinary exit from the accept loop.
 
@@ -511,6 +598,23 @@ def _install_shutdown(listener) -> None:
         signal.signal(sig, _shutdown)
 
 
+def _start_worker(conn, root: str, handshake_timeout: float, leases: _Leases) -> None:
+    worker = threading.Thread(
+        target=_serve_connection,
+        args=(conn, root, handshake_timeout, leases),
+        daemon=True,
+    )
+    if not leases.register(conn, worker):
+        conn.close()
+        return
+    try:
+        worker.start()
+    except BaseException:
+        leases.finished(conn)
+        conn.close()
+        raise
+
+
 def serve(
     sock_path: str,
     staging_root: str,
@@ -519,13 +623,21 @@ def serve(
 ) -> None:
     """Bind, announce readiness, then serve one connection per thread."""
     root = _validated_staging_root(staging_root)
-    _clear_stale_socket(sock_path)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     leases = _Leases()
+    owned_identity = None
     try:
-        listener.bind(sock_path)
-        os.chmod(sock_path, 0o600)
-        listener.listen(16)
+        socket_dir = os.path.dirname(sock_path) or "."
+        lock_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _clear_stale_socket(sock_path)
+            listener.bind(sock_path)
+            owned_identity = _socket_identity(sock_path)
+            os.chmod(sock_path, 0o600)
+            listener.listen(16)
+        finally:
+            os.close(lock_fd)
         _install_shutdown(listener)
         print(json.dumps({"ready": True, "socket": sock_path}), flush=True)
         while True:
@@ -533,19 +645,16 @@ def serve(
                 conn, _addr = listener.accept()
             except OSError:
                 break  # the shutdown handler closed the listener
-            threading.Thread(
-                target=_serve_connection,
-                args=(conn, root, handshake_timeout, leases),
-                daemon=True,
-            ).start()
+            _start_worker(conn, root, handshake_timeout, leases)
     finally:
         with contextlib.suppress(OSError):
             listener.close()
         # Daemon threads will not unwind, so shutdown — not the workers — is what keeps the
         # "nothing outlives its lease" promise when the broker itself is the one going away.
         leases.drain()
-        with contextlib.suppress(OSError):
-            os.unlink(sock_path)
+        if owned_identity is not None:
+            with contextlib.suppress(OSError):
+                _unlink_owned_socket(sock_path, owned_identity)
 
 
 def main(argv=None) -> int:

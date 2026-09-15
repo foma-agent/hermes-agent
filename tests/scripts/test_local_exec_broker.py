@@ -37,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -229,7 +230,7 @@ def _raw_request(sock_path: str, body: bytes, fds: list):
             if fds
             else []
         )
-        conn.sendmsg([body], ancillary)
+        _sendmsg_all(conn, body, ancillary)
         buf = b""
         while b"\n" not in buf:
             data = conn.recv(4096)
@@ -239,6 +240,17 @@ def _raw_request(sock_path: str, body: bytes, fds: list):
         return json.loads(buf.split(b"\n", 1)[0]) if b"\n" in buf else None
     finally:
         conn.close()
+
+
+def _sendmsg_all(conn, body: bytes, ancillary) -> None:
+    sent = 0
+    first = True
+    while sent < len(body):
+        written = conn.sendmsg([body[sent:]], ancillary if first else [])
+        if written <= 0:
+            raise ConnectionError("sendmsg made no progress")
+        sent += written
+        first = False
 
 
 @pytest.mark.linux_only
@@ -277,6 +289,34 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
 
     proc, sock_path = _start_broker("host-only-secret", root)
     try:
+        # Short writes resend only payload bytes; SCM_RIGHTS is attached exactly once.
+        class ShortSender:
+            def __init__(self, target):
+                self.target = target
+                self.ancillary_calls = 0
+
+            def sendmsg(self, buffers, ancillary):
+                self.ancillary_calls += bool(ancillary)
+                return self.target.sendmsg([buffers[0][:3]], ancillary)
+
+        send_sock, recv_sock = socket.socketpair()
+        read_fd, write_fd = os.pipe()
+        try:
+            sender = ShortSender(send_sock)
+            broker._sendmsg_all(
+                sender, b"short-write-frame", broker._ancillary([write_fd])
+            )
+            received = b""
+            while len(received) < len(b"short-write-frame"):
+                received += recv_sock.recv(128)
+            assert received == b"short-write-frame"
+            assert sender.ancillary_calls == 1
+        finally:
+            send_sock.close()
+            recv_sock.close()
+            os.close(read_fd)
+            os.close(write_fd)
+
         # --- accepted launch: env, descriptor and runner all arrive explicitly -----------
         read_fd, write_fd = os.pipe()
         try:
@@ -318,30 +358,57 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
         # --- refusals: each must be structured, and must close what it was handed --------
         baseline = _wait_for_fd_count(proc.pid, _fd_count(proc.pid))
         refusals = [
-            ("runner outside the staging root", _launch_body(outside), 1),
-            ("symlink escaping the staging root", _launch_body(escape), 1),
-            ("runner that does not exist", _launch_body(root / "gone.py"), 1),
-            ("body that is not JSON", b"{definitely not json\n", 1),
-            ("body that is not a launch request", b'{"op": "nope"}\n', 1),
+            (
+                "runner outside the staging root",
+                _launch_body(outside),
+                1,
+                "runner_outside_root",
+            ),
+            (
+                "symlink escaping the staging root",
+                _launch_body(escape),
+                1,
+                "runner_outside_root",
+            ),
+            (
+                "runner that does not exist",
+                _launch_body(root / "gone.py"),
+                1,
+                "launch_failed",
+            ),
+            ("body that is not JSON", b"{definitely not json\n", 1, "bad_request"),
+            (
+                "body that is not a launch request",
+                b'{"op": "nope"}\n',
+                1,
+                "bad_request",
+            ),
             (
                 "environment that is not an object",
                 json.dumps({"op": "launch", "runner": str(runner), "env": []}).encode()
                 + b"\n",
                 1,
+                "bad_request",
             ),
             # More descriptors than one control buffer holds: the kernel truncates and sets
             # MSG_CTRUNC, so the broker must refuse rather than launch a child whose
             # HERMES_BROKER_FDS is silently short of what the client passed.
-            ("more descriptors than MAX_FDS", _launch_body(runner), broker.MAX_FDS + 3),
+            (
+                "more descriptors than MAX_FDS",
+                _launch_body(runner),
+                broker.MAX_FDS + 3,
+                "truncated_ancillary",
+            ),
             # A body with no newline in it at all: the cap has to be on the TOTAL received,
             # not on one recv, or a peer can drive the broker to arbitrary memory.
             (
                 "body larger than the request cap",
                 b"x" * (broker.MAX_REQUEST_BYTES + 4096),
                 1,
+                "request_too_large",
             ),
         ]
-        for label, body, fd_copies in refusals:
+        for label, body, fd_copies, error in refusals:
             read_fd, write_fd = os.pipe()
             try:
                 reply = _raw_request(sock_path, body, [write_fd] * fd_copies)
@@ -349,13 +416,42 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
                 write_fd = -1
                 assert reply is not None, f"{label}: broker closed without a reply"
                 assert reply["ok"] is False, f"{label}: broker accepted the request"
-                assert reply["error"], f"{label}: reply carries no error code"
+                assert reply["error"] == error, label
                 assert reply["message"], f"{label}: reply carries no message"
                 assert _read_with_deadline(read_fd, until_eof=True) == b"", label
             finally:
                 os.close(read_fd)
                 if write_fd != -1:
                     os.close(write_fd)
+
+        # Descriptor limits apply to the whole request, not one ancillary message.
+        read_fd, write_fd = os.pipe()
+        conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            conn.settimeout(DEADLINE)
+            conn.connect(sock_path)
+            first = broker.MAX_FDS // 2 + 1
+            conn.sendmsg(
+                [b'{"op":'],
+                _ancillary := [
+                    (
+                        socket.SOL_SOCKET,
+                        socket.SCM_RIGHTS,
+                        array.array("i", [write_fd] * first),
+                    )
+                ],
+            )
+            conn.sendmsg([b'"launch"}\n'], _ancillary)
+            reply = json.loads(conn.recv(4096).split(b"\n", 1)[0])
+            os.close(write_fd)
+            write_fd = -1
+            assert reply["error"] == "too_many_fds"
+            assert _read_with_deadline(read_fd, until_eof=True) == b""
+        finally:
+            conn.close()
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
 
         # Repeating the cheapest refusal exercises the accumulation the per-arm EOF check
         # cannot see: a per-request fd leak ends at RLIMIT_NOFILE, not at one bad request.
@@ -390,7 +486,9 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
 
 
 @pytest.mark.linux_only
-def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_path):
+def test_brokered_child_is_terminated_when_the_client_connection_disappears(
+    tmp_path, monkeypatch
+):
     """Lease lifetime: nothing outlives its lease, and nothing pins a worker forever.
 
     The client connection is the broker-owned replacement for the inherited parent-death pipe
@@ -422,6 +520,20 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_
         import os
         fd = int(os.environ["HERMES_BROKER_FDS"].split(",")[0])
         os.write(fd, b"bye\\n")
+    """,
+    )
+    term_runner = _stage_runner(
+        root,
+        "term_runner.py",
+        """
+        import os, signal, time
+        fd = int(os.environ["HERMES_BROKER_FDS"].split(",")[0])
+        def stop(_signum, _frame):
+            os.write(fd, f"term {time.monotonic()}\\n".encode())
+            time.sleep(600)
+        signal.signal(signal.SIGTERM, stop)
+        os.write(fd, b"ready\\n")
+        time.sleep(600)
     """,
     )
     proc, sock_path = _start_broker("host-only-secret", root)
@@ -514,9 +626,32 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_
         finally:
             silent.close()
 
+        # The handshake window is cumulative: traffic cannot renew it one byte at a time.
+        drip = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        drip.settimeout(DEADLINE)
+        try:
+            drip.connect(sock_path)
+            started = time.monotonic()
+            for byte in b'{"op":':
+                time.sleep(HANDSHAKE_TIMEOUT / 5)
+                try:
+                    drip.sendall(bytes([byte]))
+                except BrokenPipeError:
+                    break
+            reply = drip.recv(4096)
+            elapsed = time.monotonic() - started
+            assert json.loads(reply.split(b"\n", 1)[0])["error"] == "handshake_timeout"
+            assert elapsed < HANDSHAKE_TIMEOUT * 1.5, (
+                f"slow-drip bytes renewed the handshake deadline for {elapsed:.2f}s"
+            )
+        finally:
+            drip.close()
+
         # --- the broker's own SIGTERM tears down every lease it is still holding --------
         read_fd, write_fd = os.pipe()
         held = None
+        term_leases = []
+        term_reads = []
         try:
             held, reply = broker.request_launch(
                 sock_path, runner=str(group_runner), env={}, fds=[write_fd]
@@ -526,8 +661,26 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_
             pids = json.loads(_read_with_deadline(read_fd, until_eof=False))
             doomed.extend(pids.values())
 
+            for _ in range(2):
+                term_read, term_write = os.pipe()
+                term_conn, term_reply = broker.request_launch(
+                    sock_path, runner=str(term_runner), env={}, fds=[term_write]
+                )
+                os.close(term_write)
+                assert _read_with_deadline(term_read, until_eof=False) == b"ready"
+                term_leases.append(term_conn)
+                term_reads.append(term_read)
+                doomed.append(term_reply["pid"])
+
             # The lease is still HELD: only the broker's death can end it.
             proc.send_signal(signal.SIGTERM)
+            term_times = [
+                float(_read_with_deadline(fd, until_eof=False).split()[1])
+                for fd in term_reads
+            ]
+            assert max(term_times) - min(term_times) < 0.5, (
+                "shutdown waited on one lease before notifying the next"
+            )
             assert proc.wait(timeout=DEADLINE) is not None
 
             assert _wait_until_gone(pids["child"]), (
@@ -543,6 +696,10 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_
         finally:
             if held is not None:
                 held.close()
+            for term_conn in term_leases:
+                term_conn.close()
+            for term_read in term_reads:
+                os.close(term_read)
             os.close(read_fd)
             if write_fd != -1:
                 os.close(write_fd)
@@ -553,8 +710,43 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_
         killed.kill()
         killed.wait(timeout=DEADLINE)
         assert os.path.exists(stale_path), "expected an uncleaned socket after SIGKILL"
-        restarted, _ = _start_broker("host-only-secret", root, sock_path=stale_path)
-        _stop_broker(restarted)
+        contenders = [
+            _start_broker(
+                "host-only-secret", root, sock_path=stale_path, expect_ready=False
+            )[0]
+            for _ in range(2)
+        ]
+        deadline = time.monotonic() + DEADLINE
+        while time.monotonic() < deadline and all(p.poll() is None for p in contenders):
+            time.sleep(0.05)
+        losers = [p for p in contenders if p.poll() is not None]
+        winners = [p for p in contenders if p.poll() is None]
+        assert len(losers) == len(winners) == 1
+        winner = winners[0]
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(stale_path)
+        finally:
+            probe.close()
+        assert os.path.exists(stale_path), "losing startup unlinked the winner's socket"
+        _stop_broker(winner)
+
+        # Cleanup is conditional on the bound pathname still naming this broker's socket.
+        owned_path = _socket_path()
+        first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            first.bind(owned_path)
+            identity = broker._socket_identity(owned_path)
+            os.unlink(owned_path)
+            replacement.bind(owned_path)
+            broker._unlink_owned_socket(owned_path, identity)
+            assert os.path.exists(owned_path), "cleanup unlinked a replacement socket"
+        finally:
+            first.close()
+            replacement.close()
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(owned_path)
 
         occupied = Path(_socket_path())
         occupied.write_text("not a socket\n", encoding="utf-8")
@@ -565,6 +757,71 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_
         assert occupied.read_text(encoding="utf-8") == "not a socket\n", (
             "the broker unlinked a path that was not a socket"
         )
+
+        shared_root = tmp_path / "shared-staging"
+        shared_root.mkdir(mode=0o750)
+        refused_root, refused_path = _start_broker(
+            "host-only-secret", shared_root, expect_ready=False
+        )
+        assert refused_root.wait(timeout=DEADLINE) != 0
+        assert not os.path.exists(refused_path)
+
+        # Teardown has exactly one owner, including a child spawned while shutdown is
+        # taking its registry snapshot. A late registration is handed back to its worker;
+        # a registered lease can be claimed only once.
+        leases = broker._Leases()
+        registry_client, registry_conn = socket.socketpair()
+        registered = object()
+        try:
+            assert leases.register(registry_conn, threading.current_thread()) is True
+            assert leases.add(registry_conn, registered) is True
+            assert leases.claim(registry_conn, registered) is True
+            assert leases.claim(registry_conn, registered) is False
+            leases.finished(registry_conn)
+            leases.drain()
+            late_client, late_conn = socket.socketpair()
+            try:
+                assert leases.register(late_conn, threading.current_thread()) is False
+            finally:
+                late_client.close()
+                late_conn.close()
+        finally:
+            registry_client.close()
+            registry_conn.close()
+
+        # A child still unreaped at the kill deadline retains a waiter that reaps it later.
+        class DelayedExit:
+            pid = 999_999_999
+            returncode = None
+
+            def __init__(self):
+                self.waits = 0
+
+            def wait(self, timeout=None):
+                self.waits += 1
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired("delayed", timeout)
+                self.returncode = 0
+
+        delayed = DelayedExit()
+        waiter_daemon = None
+
+        class ImmediateThread:
+            def __init__(self, *, target, daemon):
+                nonlocal waiter_daemon
+                waiter_daemon = daemon
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        monkeypatch.setattr(broker, "_signal_group", lambda *_args: None)
+        monkeypatch.setattr(broker, "_wait_unreaped", lambda *_args: None)
+        monkeypatch.setattr(broker.threading, "Thread", ImmediateThread)
+        broker._terminate_many([delayed])
+        assert delayed.returncode == 0
+        assert delayed.waits == 2
+        assert waiter_daemon is True
     finally:
         # Best-effort sweep for a run that already failed. RuntimeError is suppressed
         # alongside OSError because ``tests/conftest.py``'s live-system guard refuses
@@ -578,3 +835,80 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_
                         signal.SIGKILL,  # windows-footgun: ok — linux_only test
                     )
         _stop_broker(proc)
+
+
+@pytest.mark.linux_only
+def test_shutdown_waits_for_a_worker_spawning_before_process_registration(
+    tmp_path, monkeypatch
+):
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(root, "blocked_launch.py", "import time; time.sleep(600)\n")
+    client, accepted = socket.socketpair()
+    leases = broker._Leases()
+    launched = threading.Event()
+    release_launch = threading.Event()
+    child_pid = None
+    real_launch = broker._launch
+
+    def launch_then_block(*args, **kwargs):
+        nonlocal child_pid
+        proc = real_launch(*args, **kwargs)
+        child_pid = proc.pid
+        launched.set()
+        assert release_launch.wait(DEADLINE)
+        return proc
+
+    monkeypatch.setattr(broker, "_launch", launch_then_block)
+    worker = threading.Thread(
+        target=broker._serve_connection,
+        args=(accepted, str(root), HANDSHAKE_TIMEOUT, leases),
+        daemon=True,
+    )
+    leases.register(accepted, worker)
+    worker.start()
+    drain = threading.Thread(target=leases.drain)
+    try:
+        client.sendall(_launch_body(runner))
+        assert launched.wait(DEADLINE), "the real child was not spawned"
+        drain.start()
+        drain.join(0.2)
+        assert drain.is_alive(), (
+            "drain returned while a registered worker's spawned child was still "
+            "between Popen and process registration"
+        )
+        release_launch.set()
+        drain.join(DEADLINE)
+        assert not drain.is_alive(), "drain did not wait for the registered worker"
+        assert child_pid is not None and _wait_until_gone(child_pid)
+
+        failed_client, failed_conn = socket.socketpair()
+
+        class FailingThread:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("thread start failed")
+
+        monkeypatch.setattr(broker.threading, "Thread", FailingThread)
+        failed_leases = broker._Leases()
+        with pytest.raises(RuntimeError, match="thread start failed"):
+            broker._start_worker(
+                failed_conn, str(root), HANDSHAKE_TIMEOUT, failed_leases
+            )
+        failed_client.settimeout(DEADLINE)
+        assert failed_client.recv(1) == b""
+        failed_leases.drain()
+        failed_client.close()
+    finally:
+        release_launch.set()
+        client.close()
+        accepted.close()
+        worker.join(DEADLINE)
+        drain.join(DEADLINE)
+        if child_pid is not None and _pid_running(child_pid):
+            os.kill(
+                child_pid,
+                signal.SIGKILL,  # windows-footgun: ok — linux_only test
+            )
