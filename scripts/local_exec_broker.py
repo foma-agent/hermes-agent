@@ -574,25 +574,24 @@ def _clear_stale_socket(sock_path: str) -> None:
     os.unlink(sock_path)
 
 
-def _socket_identity(sock_path: str) -> tuple[int, int]:
-    info = os.lstat(sock_path)
-    return info.st_dev, info.st_ino
-
-
-def _unlink_owned_socket(sock_path: str, identity: tuple[int, int]) -> None:
+def _unlink_owned_socket(sock_path: str, owned_fd: int) -> None:
     """Unlink *sock_path* only while it still names the socket we bound."""
-    socket_dir = os.path.dirname(sock_path) or "."
-    lock_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        socket_dir = os.path.dirname(sock_path) or "."
+        lock_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
-            current = _socket_identity(sock_path)
-        except FileNotFoundError:
-            return
-        if current == identity:
-            os.unlink(sock_path)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                current = os.lstat(sock_path)
+            except FileNotFoundError:
+                return
+            owned = os.fstat(owned_fd)
+            if (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino):
+                os.unlink(sock_path)
+        finally:
+            os.close(lock_fd)
     finally:
-        os.close(lock_fd)
+        os.close(owned_fd)
 
 
 def _install_shutdown(listener) -> None:
@@ -637,7 +636,7 @@ def serve(
     root = _validated_staging_root(staging_root)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     leases = _Leases()
-    owned_identity = None
+    owned_fd = None
     publish_dir = None
     temporary_socket = None
     try:
@@ -647,6 +646,8 @@ def serve(
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             _clear_stale_socket(sock_path)
             for suffix in _PUBLISH_SUFFIXES:
+                if suffix == os.path.basename(sock_path):
+                    continue
                 candidate = os.path.join(socket_dir, suffix)
                 try:
                     os.mkdir(candidate, 0o700)
@@ -664,9 +665,13 @@ def serve(
             listener.bind(temporary_socket)
             listener.listen(16)
             os.chmod(temporary_socket, 0o600)
-            temporary_identity = _socket_identity(temporary_socket)
+            owned_fd = os.open(
+                temporary_socket,
+                os.O_PATH
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,  # windows-footgun: ok — Linux-only broker
+            )
             os.link(temporary_socket, sock_path)
-            owned_identity = temporary_identity
             os.unlink(temporary_socket)
             temporary_socket = None
             os.rmdir(publish_dir)
@@ -694,9 +699,9 @@ def serve(
         # Daemon threads will not unwind, so shutdown — not the workers — is what keeps the
         # "nothing outlives its lease" promise when the broker itself is the one going away.
         leases.drain()
-        if owned_identity is not None:
+        if owned_fd is not None:
             with contextlib.suppress(OSError):
-                _unlink_owned_socket(sock_path, owned_identity)
+                _unlink_owned_socket(sock_path, owned_fd)
         if temporary_socket is not None:
             with contextlib.suppress(OSError):
                 os.unlink(temporary_socket)

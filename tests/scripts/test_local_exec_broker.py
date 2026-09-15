@@ -360,6 +360,31 @@ def test_broker_launches_from_long_socket_directory(tmp_path):
 
 
 @pytest.mark.linux_only
+def test_broker_launches_when_socket_basename_is_publication_suffix(tmp_path):
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
+    socket_dir = tempfile.mkdtemp(prefix="hbrk_")
+    sock_path = os.path.join(socket_dir, "0")
+
+    proc = None
+    conn = None
+    try:
+        proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
+        broker = _load_broker()
+        conn, reply = broker.request_launch(
+            sock_path, runner=str(runner), env={}, fds=[]
+        )
+        assert reply["ok"] is True
+    finally:
+        if conn is not None:
+            conn.close()
+        if proc is not None:
+            _stop_broker(proc)
+        with contextlib.suppress(FileNotFoundError):
+            os.rmdir(socket_dir)
+
+
+@pytest.mark.linux_only
 def test_fifo_runner_is_refused_without_blocking_shutdown(tmp_path):
     root = _staging_root(tmp_path)
     fifo = root / "runner.py"
@@ -468,20 +493,17 @@ def test_shutdown_cleanup_cannot_unlink_replacement_socket(monkeypatch):
     first = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     first.bind(sock_path)
-    owned_identity = broker._socket_identity(sock_path)
+    owned_fd = os.open(
+        sock_path,
+        os.O_PATH
+        | os.O_NOFOLLOW
+        | os.O_CLOEXEC,  # windows-footgun: ok — linux_only test
+    )
     publisher_holds_lock = threading.Event()
     publish_replacement = threading.Event()
     replacement_published = threading.Event()
     thread_errors = []
     real_flock = fcntl.flock
-    real_socket_identity = broker._socket_identity
-
-    def coordinated_identity(path):
-        identity = real_socket_identity(path)
-        if threading.current_thread().name == "cleanup":
-            publish_replacement.set()
-            assert replacement_published.wait(DEADLINE)
-        return identity
 
     def coordinated_flock(fd, operation):
         if threading.current_thread().name == "cleanup":
@@ -509,10 +531,9 @@ def test_shutdown_cleanup_cannot_unlink_replacement_socket(monkeypatch):
     publisher = threading.Thread(target=publish, name="publisher")
     cleanup = threading.Thread(
         target=broker._unlink_owned_socket,
-        args=(sock_path, owned_identity),
+        args=(sock_path, owned_fd),
         name="cleanup",
     )
-    monkeypatch.setattr(broker, "_socket_identity", coordinated_identity)
     monkeypatch.setattr(broker.fcntl, "flock", coordinated_flock)
     publisher.start()
     assert publisher_holds_lock.wait(DEADLINE)
@@ -522,6 +543,9 @@ def test_shutdown_cleanup_cannot_unlink_replacement_socket(monkeypatch):
         cleanup.join(DEADLINE)
         assert not publisher.is_alive() and not cleanup.is_alive()
         assert not thread_errors
+        with pytest.raises(OSError) as closed:
+            os.fstat(owned_fd)
+        assert closed.value.errno == errno.EBADF
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             probe.connect(sock_path)
@@ -532,6 +556,8 @@ def test_shutdown_cleanup_cannot_unlink_replacement_socket(monkeypatch):
         replacement_published.set()
         publisher.join(DEADLINE)
         cleanup.join(DEADLINE)
+        with contextlib.suppress(OSError):
+            os.close(owned_fd)
         first.close()
         replacement.close()
         with contextlib.suppress(FileNotFoundError):
@@ -1041,10 +1067,15 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
         replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             first.bind(owned_path)
-            identity = broker._socket_identity(owned_path)
+            owned_fd = os.open(
+                owned_path,
+                os.O_PATH
+                | os.O_NOFOLLOW
+                | os.O_CLOEXEC,  # windows-footgun: ok — linux_only test
+            )
             os.unlink(owned_path)
             replacement.bind(owned_path)
-            broker._unlink_owned_socket(owned_path, identity)
+            broker._unlink_owned_socket(owned_path, owned_fd)
             assert os.path.exists(owned_path), "cleanup unlinked a replacement socket"
         finally:
             first.close()
