@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Local execution broker — runnable prototype for #59293. Linux/POSIX, stdlib only.
 
-    python scripts/local_exec_broker.py --socket /run/user/1000/hermes-broker.sock
+    python scripts/local_exec_broker.py \
+        --socket /run/user/1000/hermes-broker.sock --staging-root /run/user/1000/hermes-stage
 
 The problem it exists to solve: the argv-only ``sudo -u`` carrier closed the same-UID policy
 escape but broke ``execute_code``, because ``sudo`` is a *privilege* tool, not a *transport*.
@@ -20,13 +21,33 @@ channel that survives a uid switch:
   descriptors   the client passes open fds over ``SCM_RIGHTS``. The broker forwards them by
                 number via ``pass_fds`` and publishes those numbers as ``HERMES_BROKER_FDS``,
                 then closes its own copies so it never holds a peer's channel open.
-  runner        the broker opens the staged runner itself (it owns the 0700 dir) and the
-                child reads it back through ``/proc/self/fd/<n>``. Reopening a regular file
-                through procfs re-checks the INODE bits but skips directory traversal, so the
-                staging dir is never relaxed for anyone else.
+  runner        the broker resolves the request against the staging root IT was configured
+                with, opens the file itself, and the child reads it back through
+                ``/proc/self/fd/<n>``. Reopening a regular file through procfs re-checks the
+                INODE bits but skips directory traversal, so the staging dir is never
+                relaxed for anyone else.
   lifetime      the client connection IS the lease. Its EOF — close, crash, SIGKILL — is what
                 kills the child process group, the same signal shape as the inherited
                 parent-death pipe, but owned by the broker rather than inherited through sudo.
+
+Everything the child does not receive explicitly, it does not get: stdin, stdout AND stderr
+are all ``DEVNULL``, so no channel crosses the boundary by inheritance.
+
+**The request frame is the only untrusted surface, so it is the one that is bounded.** A
+request is one newline-terminated JSON object of at most ``MAX_REQUEST_BYTES`` carrying at
+most ``MAX_FDS`` descriptors, read under a handshake timeout. Every refusal is a structured
+``{"ok": false, "error", "message"}`` reply, and — the invariant that matters more — every
+refusal closes the descriptors the kernel already installed on the broker's behalf. A
+retained copy is not merely a leaked fd: it is the peer's channel, and it keeps their pipe
+from ever reaching EOF.
+
+Prototype trust boundary, stated so it is not mistaken for the finished one: the socket is
+0600 and the peer is therefore the broker's OWN uid. The client's ``env`` payload is passed
+to the child verbatim because at this boundary it IS the approved child environment — the
+same dict ``code_kernel._spawn`` builds today. The staging-root containment above is what
+must hold *before* that boundary moves; when the peer becomes a lower-privileged uid, this
+file additionally needs peer-credential checks (``SO_PEERCRED``) and a decision about which
+interpreter-controlling variables a less-trusted peer may set. Neither is in scope here.
 
 Future integration seam (deliberately NOT wired yet, so nothing dead lands in core):
 
@@ -49,8 +70,10 @@ import array
 import contextlib
 import json
 import os
+import selectors
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -58,9 +81,29 @@ import threading
 # Child-visible fd numbers the broker forwarded on its behalf, comma separated.
 FDS_ENV = "HERMES_BROKER_FDS"
 
+# Caps on the one untrusted surface. These bound the TOTAL for a request, not a single recv.
 MAX_FDS = 8
-_HEADER_BYTES = 65536
+MAX_REQUEST_BYTES = 65536
+DEFAULT_HANDSHAKE_TIMEOUT = 10.0
+
+_INT_SIZE = array.array("i").itemsize
+_RECV_CHUNK = 4096
 _TERM_GRACE_SECONDS = 2.0
+_KILL_GRACE_SECONDS = 2.0
+
+
+class BrokerError(RuntimeError):
+    """A refusal, carrying the same ``code`` on both sides of the socket.
+
+    The broker raises it, replies with ``code``/``message``, and the client re-raises it from
+    that reply — so a caller sees a typed failure it can branch on instead of whatever
+    exception happens to fall out of parsing an empty read.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.message = message
 
 
 def request_launch(
@@ -69,139 +112,458 @@ def request_launch(
     """Client side: ask the broker to launch *runner*; return ``(connection, reply)``.
 
     The caller MUST hold the returned connection open for as long as the child should
-    live — the broker treats its EOF as the order to tear the child down.
+    live — the broker treats its EOF as the order to tear the child down. On any failure the
+    connection is closed here and a :class:`BrokerError` is raised; the caller never inherits
+    a socket it did not get a child for.
     """
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.settimeout(timeout)
-    conn.connect(sock_path)
-    body = (
-        json.dumps({"op": "launch", "runner": runner, "env": env}).encode("utf-8")
-        + b"\n"
-    )
-    conn.sendmsg(
-        [body], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))]
-    )
-    return conn, json.loads(_read_line(conn))
+    try:
+        conn.settimeout(timeout)
+        conn.connect(sock_path)
+        body = (
+            json.dumps({"op": "launch", "runner": runner, "env": env}).encode("utf-8")
+            + b"\n"
+        )
+        conn.sendmsg([body], _ancillary(fds))
+        reply = _read_reply(conn)
+        if not reply.get("ok"):
+            raise BrokerError(
+                reply.get("error") or "unknown",
+                reply.get("message") or "launch refused",
+            )
+    except BaseException:
+        conn.close()
+        raise
+    return conn, reply
 
 
-def _read_line(conn) -> bytes:
-    """Read one newline-terminated frame (no ancillary data expected)."""
+def _ancillary(fds):
+    return (
+        [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", list(fds)))]
+        if fds
+        else []
+    )
+
+
+def _read_reply(conn) -> dict:
+    """Read one newline-terminated reply frame (no ancillary data expected)."""
     buf = b""
     while b"\n" not in buf:
-        chunk = conn.recv(4096)
+        chunk = conn.recv(_RECV_CHUNK)
         if not chunk:
-            break
+            raise BrokerError(
+                "no_reply", "broker closed the connection without replying"
+            )
         buf += chunk
-    return buf.split(b"\n", 1)[0]
-
-
-def _recv_request(conn):
-    """Read one request frame plus every descriptor that rode along with it."""
-    buf, fds = b"", []
-    while b"\n" not in buf:
-        msg, ancdata, _flags, _addr = conn.recvmsg(
-            _HEADER_BYTES, socket.CMSG_SPACE(MAX_FDS * array.array("i").itemsize)
-        )
-        for level, kind, data in ancdata:
-            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                received = array.array("i")
-                received.frombytes(data[: len(data) - (len(data) % received.itemsize)])
-                fds.extend(received)
-        if not msg:
-            break
-        buf += msg
-    if b"\n" not in buf:
-        return None, fds
-    return json.loads(buf.split(b"\n", 1)[0]), fds
-
-
-def _launch(request: dict, fds: list):
-    """Spawn the child with everything handed over explicitly."""
-    # The broker owns the 0700 staging dir, so it — not the child — resolves the path.
-    runner_fd = os.open(request["runner"], os.O_RDONLY)
+        if len(buf) > MAX_REQUEST_BYTES:
+            raise BrokerError("bad_reply", "broker reply exceeded the frame cap")
     try:
-        child_env = dict(request.get("env") or {})
-        child_env[FDS_ENV] = ",".join(str(fd) for fd in fds)
-        # pass_fds keeps each descriptor at its own number in the child, which is what makes
-        # both FDS_ENV and the /proc/self/fd runner path resolvable on the far side.
-        return subprocess.Popen(
-            [sys.executable, f"/proc/self/fd/{runner_fd}"],
-            env=child_env,
-            pass_fds=(runner_fd, *fds),
-            close_fds=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            start_new_session=True,
+        return json.loads(buf.split(b"\n", 1)[0])
+    except json.JSONDecodeError as exc:
+        raise BrokerError("bad_reply", f"broker reply was not JSON: {exc}") from exc
+
+
+def _close_all(fds) -> None:
+    while fds:
+        with contextlib.suppress(OSError):
+            os.close(fds.pop())
+
+
+def _recv_request(conn, fds: list):
+    """Read one bounded request frame, appending every received descriptor to *fds*.
+
+    *fds* is the CALLER's list on purpose. The kernel installs descriptors into this process
+    the moment they arrive, including on a request that turns out to be garbage; making the
+    caller the owner from the first byte is what keeps "who closes this" answerable on every
+    path out of here.
+    """
+    buf = b""
+    while b"\n" not in buf:
+        try:
+            msg, ancdata, flags, _addr = conn.recvmsg(
+                _RECV_CHUNK, socket.CMSG_SPACE(MAX_FDS * _INT_SIZE)
+            )
+        except TimeoutError as exc:
+            raise BrokerError(
+                "handshake_timeout", "no complete request within the handshake window"
+            ) from exc
+        for level, kind, data in ancdata:
+            if level != socket.SOL_SOCKET or kind != socket.SCM_RIGHTS:
+                continue
+            if len(data) % _INT_SIZE:
+                raise BrokerError(
+                    "truncated_ancillary", "partial descriptor in ancillary data"
+                )
+            received = array.array("i")
+            received.frombytes(data)
+            fds.extend(received)
+        # The kernel installs as many descriptors as the control buffer holds, CLOSES the
+        # rest and sets MSG_CTRUNC. Ignoring it means launching a child whose
+        # HERMES_BROKER_FDS is silently shorter than what the client passed.
+        if flags & socket.MSG_CTRUNC:
+            raise BrokerError(
+                "truncated_ancillary",
+                f"ancillary data was truncated; at most {MAX_FDS} descriptors per request",
+            )
+        if len(fds) > MAX_FDS:
+            raise BrokerError(
+                "too_many_fds",
+                f"at most {MAX_FDS} descriptors may be passed per request",
+            )
+        if not msg:
+            raise BrokerError(
+                "incomplete_request", "peer closed before sending a complete request"
+            )
+        buf += msg
+        if len(buf) > MAX_REQUEST_BYTES:
+            raise BrokerError(
+                "request_too_large",
+                f"request exceeded {MAX_REQUEST_BYTES} bytes with no frame terminator",
+            )
+    try:
+        request = json.loads(buf.split(b"\n", 1)[0])
+    except json.JSONDecodeError as exc:
+        raise BrokerError("bad_request", f"request was not JSON: {exc}") from exc
+    return _validated(request)
+
+
+def _validated(request):
+    """Structural validation only — return ``(runner, env)``.
+
+    This checks the SHAPE of the payload, not its content: the env dict is the approved child
+    environment and is forwarded verbatim (see the trust-boundary note in the module
+    docstring). NUL is rejected because it would truncate silently at ``execve``.
+    """
+    if not isinstance(request, dict):
+        raise BrokerError("bad_request", "request must be a JSON object")
+    if request.get("op") != "launch":
+        raise BrokerError("bad_request", f"unsupported op {request.get('op')!r}")
+    runner = request.get("runner")
+    if not isinstance(runner, str) or not runner:
+        raise BrokerError("bad_request", "'runner' must be a non-empty string")
+    if "env" not in request:
+        env = {}
+    else:
+        env = request["env"]
+    if not isinstance(env, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in env.items()
+    ):
+        raise BrokerError(
+            "bad_request", "'env' must be a JSON object of string to string"
         )
+    if any("\0" in key or "\0" in value for key, value in env.items()):
+        raise BrokerError("bad_request", "environment entries must not contain NUL")
+    return runner, env
+
+
+def _resolve_runner(staging_root: str, runner: str) -> str:
+    """Resolve *runner* to a real path strictly inside *staging_root*.
+
+    The runner transport only means anything if the BROKER is the side that resolves the
+    path. ``realpath`` collapses ``..`` and follows symlinks BEFORE the containment test, so
+    a symlink staged inside the root but pointing out of it is refused rather than followed.
+    """
+    resolved = os.path.realpath(runner)
+    if not resolved.startswith(staging_root + os.sep):
+        raise BrokerError(
+            "runner_outside_root",
+            f"runner resolves outside the staging root {staging_root}",
+        )
+    return resolved
+
+
+def _open_runner(path: str) -> int:
+    """Open the staged runner. ``O_NOFOLLOW`` closes the realpath-then-open swap window."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise BrokerError("runner_not_regular", "runner is not a regular file")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _launch(runner_fd: int, env: dict, fds: list):
+    """Spawn the child with everything handed over explicitly."""
+    child_env = dict(env)
+    child_env[FDS_ENV] = ",".join(str(fd) for fd in fds)
+    # pass_fds keeps each descriptor at its own number in the child, which is what makes both
+    # FDS_ENV and the /proc/self/fd runner path resolvable on the far side.
+    return subprocess.Popen(
+        [sys.executable, f"/proc/self/fd/{runner_fd}"],
+        env=child_env,
+        pass_fds=(runner_fd, *fds),
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        # Explicit, like stdin and stdout. An inherited stderr is a channel the client never
+        # asked for: a write handle into the trusted side's log stream, and an undrained pipe
+        # the child can wedge itself on.
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def _signal_group(pid: int, sig) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, sig)  # windows-footgun: ok — Linux-only broker
+
+
+def _wait_unreaped(pid: int, timeout: float) -> None:
+    """Wait up to *timeout* for *pid* to exit, deliberately leaving it UNREAPED.
+
+    ``Popen.wait``/``poll`` would reap it, and a reaped pid can be recycled — after which the
+    pgid we are about to sweep may belong to somebody else entirely.
+    """
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        with selectors.DefaultSelector() as sel:
+            sel.register(pidfd, selectors.EVENT_READ)
+            sel.select(timeout)
     finally:
-        # Every forwarded descriptor is the peer's channel, not ours: the child holds its own
-        # copies, and a retained copy here would keep a pipe from ever reaching EOF.
-        os.close(runner_fd)
-        for fd in fds:
-            os.close(fd)
+        os.close(pidfd)
 
 
 def _terminate(proc) -> None:
-    """Tear the child's process group down and REAP it.
+    """Tear the child's process GROUP down and REAP the leader.
 
     ``start_new_session=True`` made the child its own group leader, so its pid is the pgid —
     no ``getpgid`` lookup to race against an already-exited child. Reaping is part of the
     contract, not cleanup: an unreaped child is still a ``/proc`` entry that answers
     ``kill(pid, 0)``, i.e. indistinguishable from one that outlived its lease.
     """
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(proc.pid, signal.SIGTERM)  # windows-footgun: ok — Linux-only broker
-    try:
-        proc.wait(timeout=_TERM_GRACE_SECONDS)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(  # windows-footgun: ok — Linux-only broker
-                proc.pid,
-                signal.SIGKILL,  # windows-footgun: ok — Linux-only broker
-            )
-        proc.wait()
+    if proc.returncode is not None:
+        return  # already torn down by the other path (shutdown drain vs. worker unwind)
+    _signal_group(proc.pid, signal.SIGTERM)
+    _wait_unreaped(proc.pid, _TERM_GRACE_SECONDS)
+    # The leader is still unreaped, so its pid — and with it the pgid — cannot have been
+    # recycled. This is the only safe moment to sweep descendants that outlived the leader or
+    # ignored the SIGTERM; they are not our children, so we signal them and let init reap.
+    _signal_group(
+        proc.pid,
+        signal.SIGKILL,  # windows-footgun: ok — Linux-only broker
+    )
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        # Bounded on purpose. A child wedged in uninterruptible sleep (a stalled NFS or FUSE
+        # read) does not die until its syscall returns, and by here the connection is already
+        # closed — there is no channel left to nudge this thread on, so an unbounded wait
+        # would pin a worker for the life of the broker.
+        proc.wait(timeout=_KILL_GRACE_SECONDS)
 
 
-def _serve_connection(conn) -> None:
-    proc = None
-    try:
-        request, fds = _recv_request(conn)
-        if request is None:
-            for fd in fds:
-                os.close(fd)
-            return
-        proc = _launch(request, fds)
-        conn.sendall(json.dumps({"ok": True, "pid": proc.pid}).encode("utf-8") + b"\n")
-        # The connection IS the child's lease. Hold it open and read until EOF: a clean close,
-        # a crashed client or a SIGKILLed one all surface the same way, which is exactly the
-        # signal the inherited parent-death pipe gave us before sudo started closing it.
-        with contextlib.suppress(OSError):
-            conn.settimeout(None)
-            while conn.recv(4096):
-                pass
-    finally:
-        conn.close()
-        if proc is not None:
+class _Leases:
+    """Every child currently under a lease, so shutdown can tear them down.
+
+    Worker threads are daemons, so at interpreter exit their ``finally`` blocks never run.
+    Without this registry a SIGTERM leaves every leased child orphaned — reparented to init,
+    detached from the broker's session by ``start_new_session``, still holding descriptors its
+    client has already dropped. That is exactly the state ``_terminate`` exists to prevent.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._procs = set()
+
+    def add(self, proc) -> None:
+        with self._lock:
+            self._procs.add(proc)
+
+    def discard(self, proc) -> None:
+        with self._lock:
+            self._procs.discard(proc)
+
+    def drain(self) -> None:
+        with self._lock:
+            procs, self._procs = list(self._procs), set()
+        for proc in procs:
             _terminate(proc)
 
 
-def serve(sock_path: str) -> None:
+def _reply(conn, payload: dict) -> None:
+    with contextlib.suppress(OSError):
+        conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+
+
+def _await_lease_end(conn, proc) -> None:
+    """Block until the lease ends — the client's EOF, or the child exiting on its own.
+
+    Watching only the connection makes the lease one-directional: a child that finishes
+    normally would leave this thread parked in ``recv`` until the client happened to
+    disconnect, holding an unreaped child the whole time. The pidfd is the other half, and it
+    reports the exit WITHOUT reaping, so ``_terminate`` still owns the group sweep.
+    """
+    conn.settimeout(None)
+    try:
+        pidfd = os.pidfd_open(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        with selectors.DefaultSelector() as sel:
+            sel.register(pidfd, selectors.EVENT_READ)
+            sel.register(conn, selectors.EVENT_READ)
+            while True:
+                for key, _mask in sel.select():
+                    if key.fd == pidfd or not conn.recv(_RECV_CHUNK):
+                        return
+    finally:
+        os.close(pidfd)
+
+
+def _serve_connection(
+    conn, staging_root: str, handshake_timeout: float, leases: _Leases
+) -> None:
+    proc, runner_fd = None, None
+    # Descriptors the kernel installed on our behalf. One owner, one close, every path out.
+    fds: list = []
+    try:
+        try:
+            conn.settimeout(handshake_timeout)
+            runner, env = _recv_request(conn, fds)
+            runner_fd = _open_runner(_resolve_runner(staging_root, runner))
+            proc = _launch(runner_fd, env, fds)
+        except BrokerError as exc:
+            _reply(conn, {"ok": False, "error": exc.code, "message": exc.message})
+            return
+        except OSError as exc:
+            _reply(conn, {"ok": False, "error": "launch_failed", "message": str(exc)})
+            return
+        finally:
+            # Every forwarded descriptor is the peer's channel, not ours: the child holds its
+            # own copies, and a retained copy here would keep a pipe from ever reaching EOF.
+            _close_all(fds)
+            if runner_fd is not None:
+                os.close(runner_fd)
+        # Registered BEFORE the reply: a SIGTERM racing the handshake must still find this
+        # child, or it is orphaned in the one window where nobody is watching it.
+        leases.add(proc)
+        _reply(conn, {"ok": True, "pid": proc.pid})
+        # The connection IS the child's lease. A clean close, a crashed client or a SIGKILLed
+        # one all surface the same way, which is exactly the signal the inherited
+        # parent-death pipe gave us before sudo started closing it.
+        with contextlib.suppress(OSError):
+            _await_lease_end(conn, proc)
+    finally:
+        with contextlib.suppress(OSError):
+            conn.close()
+        if proc is not None:
+            _terminate(proc)
+            leases.discard(proc)
+
+
+def _validated_staging_root(path: str) -> str:
+    root = os.path.realpath(path)
+    if not os.path.isdir(root):
+        raise SystemExit(f"staging root is not a directory: {path}")
+    return root
+
+
+def _clear_stale_socket(sock_path: str) -> None:
+    """Remove a socket left behind by an unclean shutdown — and nothing else.
+
+    ``lstat``, not ``stat``: the decision is about the path itself, so a symlink parked here
+    pointing at something that matters is refused rather than followed and unlinked. Anything
+    that is not a socket is somebody else's file; the broker declines to start instead.
+    """
+    try:
+        mode = os.lstat(sock_path).st_mode
+    except FileNotFoundError:
+        return
+    if not stat.S_ISSOCK(mode):
+        raise SystemExit(
+            f"refusing to replace a path that is not a socket: {sock_path}"
+        )
+
+    # A socket pathname is not stale merely because it already exists. Probe it before
+    # unlinking: stealing a live broker's path leaves that process running but unreachable.
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(0.2)
+    try:
+        probe.connect(sock_path)
+    except (ConnectionRefusedError, FileNotFoundError):
+        pass
+    except OSError as exc:
+        raise SystemExit(
+            f"refusing to replace an uncertain socket: {sock_path}: {exc}"
+        ) from exc
+    else:
+        raise SystemExit(f"refusing to replace a live broker socket: {sock_path}")
+    finally:
+        probe.close()
+    os.unlink(sock_path)
+
+
+def _install_shutdown(listener) -> None:
+    """Turn SIGTERM/SIGINT into an ordinary exit from the accept loop.
+
+    Closing the listener is what breaks ``accept``: under PEP 475 Python retries an
+    EINTR-interrupted syscall itself, so a handler that merely set a flag would go unnoticed
+    until the next connection happened to arrive.
+    """
+
+    def _shutdown(_signum, _frame):
+        listener.close()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _shutdown)
+
+
+def serve(
+    sock_path: str,
+    staging_root: str,
+    *,
+    handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+) -> None:
     """Bind, announce readiness, then serve one connection per thread."""
+    root = _validated_staging_root(staging_root)
+    _clear_stale_socket(sock_path)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(sock_path)
-    os.chmod(sock_path, 0o600)
-    listener.listen(16)
-    print(json.dumps({"ready": True, "socket": sock_path}), flush=True)
-    while True:
-        conn, _addr = listener.accept()
-        threading.Thread(target=_serve_connection, args=(conn,), daemon=True).start()
+    leases = _Leases()
+    try:
+        listener.bind(sock_path)
+        os.chmod(sock_path, 0o600)
+        listener.listen(16)
+        _install_shutdown(listener)
+        print(json.dumps({"ready": True, "socket": sock_path}), flush=True)
+        while True:
+            try:
+                conn, _addr = listener.accept()
+            except OSError:
+                break  # the shutdown handler closed the listener
+            threading.Thread(
+                target=_serve_connection,
+                args=(conn, root, handshake_timeout, leases),
+                daemon=True,
+            ).start()
+    finally:
+        with contextlib.suppress(OSError):
+            listener.close()
+        # Daemon threads will not unwind, so shutdown — not the workers — is what keeps the
+        # "nothing outlives its lease" promise when the broker itself is the one going away.
+        leases.drain()
+        with contextlib.suppress(OSError):
+            os.unlink(sock_path)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--socket", required=True, help="AF_UNIX path to bind")
+    parser.add_argument(
+        "--staging-root",
+        required=True,
+        help="directory the broker owns; runners outside it are refused",
+    )
+    parser.add_argument(
+        "--handshake-timeout",
+        type=float,
+        default=DEFAULT_HANDSHAKE_TIMEOUT,
+        help="seconds a connection may take to send one complete request",
+    )
     args = parser.parse_args(argv)
-    serve(args.socket)
+    serve(args.socket, args.staging_root, handshake_timeout=args.handshake_timeout)
     return 0
 
 

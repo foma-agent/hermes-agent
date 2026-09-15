@@ -11,24 +11,28 @@ escape but broke ``execute_code`` three ways at once, all of them the same root 
   * the kernel staging dir is ``tempfile.mkdtemp()`` (0700), which the new uid cannot
     traverse to reach ``hermes_kernel_runner.py``.
 
-The broker transports each of those explicitly instead, so these tests pin the transport
-contract rather than the eventual uid switch: an approved env value arrives (and the
-broker's own environment does not), a descriptor the broker only ever learns about through
-``SCM_RIGHTS`` is the channel the child reports on, and the staged runner executes while its
-directory stays 0700.
+Two tests, one vertical contract each:
 
-Real processes throughout: a separately spawned broker, a real ``AF_UNIX`` connection, a real
-child. Nothing here is mocked — the point is the boundary.
+  1. **Transport + protocol.** What the broker accepts, what it refuses, and who owns a
+     descriptor that arrived over ``SCM_RIGHTS``. Every refusal path is also an fd-ownership
+     path: the broker must close what it received, or the peer's pipe never reaches EOF.
+  2. **Lease lifetime.** Nothing outlives its lease (child, descendants, broker shutdown) and
+     nothing pins a worker thread forever (a child that exits on its own, a silent peer).
+
+Real processes throughout: a separately spawned broker, a real ``AF_UNIX`` connection, real
+children and grandchildren. Nothing here is mocked — the point is the boundary.
 """
 
 from __future__ import annotations
 
+import array
 import contextlib
 import importlib.util
 import json
 import os
+import selectors
 import signal
-import stat
+import socket
 import subprocess
 import sys
 import tempfile
@@ -41,6 +45,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BROKER_PATH = REPO_ROOT / "scripts" / "local_exec_broker.py"
 
+# Wall-clock ceilings. Generous on purpose: these bound a FAILURE (the thing under test never
+# happened) rather than pace a success, and the suite runner is not a quiet machine.
+DEADLINE = 15.0
+HANDSHAKE_TIMEOUT = 2.0
+
 
 def _load_broker():
     """Import the broker script as a module (``scripts/`` is not a package)."""
@@ -51,20 +60,34 @@ def _load_broker():
     return module
 
 
-def _start_broker(host_only_value):
+def _socket_path():
+    """A short-named socket path.
+
+    Not under ``tmp_path``: pytest's per-test directory names push an ``AF_UNIX`` path past
+    the 108-byte ``sun_path`` limit. ``code_kernel._bind_rpc_socket`` binds short names in
+    ``gettempdir()`` for the same reason.
+    """
+    return os.path.join(tempfile.mkdtemp(prefix="hbrk_"), "b.sock")
+
+
+def _start_broker(host_only_value, staging_root, *, sock_path=None, expect_ready=True):
     """Spawn the broker as its own process; return (proc, socket path).
 
     ``host_only_value`` lands in the BROKER's environment only. A child that can see it
     inherited the broker's env instead of receiving the approved one.
-
-    The socket lives in its own short-named temp dir, not under ``tmp_path``: pytest's
-    per-test directory names push an ``AF_UNIX`` path past the 108-byte sun_path limit.
-    ``code_kernel._bind_rpc_socket`` binds short names in ``gettempdir()`` for the same reason.
     """
-    sock_dir = tempfile.mkdtemp(prefix="hbrk_")
-    sock_path = os.path.join(sock_dir, "b.sock")
+    sock_path = sock_path or _socket_path()
     proc = subprocess.Popen(
-        [sys.executable, str(BROKER_PATH), "--socket", sock_path],
+        [
+            sys.executable,
+            str(BROKER_PATH),
+            "--socket",
+            sock_path,
+            "--staging-root",
+            str(staging_root),
+            "--handshake-timeout",
+            str(HANDSHAKE_TIMEOUT),
+        ],
         env={
             "PATH": os.environ.get("PATH", ""),
             "BROKER_PROBE_HOST_ONLY": host_only_value,
@@ -76,12 +99,20 @@ def _start_broker(host_only_value):
         encoding="utf-8",
         errors="replace",
     )
+    if not expect_ready:
+        return proc, sock_path
     ready = proc.stdout.readline()
     if not ready:
         proc.terminate()
         pytest.fail(f"broker never became ready; stderr:\n{proc.stderr.read()}")
     assert json.loads(ready)["ready"] is True, f"broker never became ready: {ready!r}"
     return proc, sock_path
+
+
+def _stop_broker(proc):
+    proc.terminate()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=10)
 
 
 def _pid_running(pid: int) -> bool:
@@ -95,7 +126,7 @@ def _pid_running(pid: int) -> bool:
     return stat_line.rsplit(") ", 1)[1].split(" ", 1)[0] != "Z"
 
 
-def _wait_until_gone(pid: int, timeout: float) -> bool:
+def _wait_until_gone(pid: int, timeout: float = DEADLINE) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if not _pid_running(pid):
@@ -104,112 +135,446 @@ def _wait_until_gone(pid: int, timeout: float) -> bool:
     return not _pid_running(pid)
 
 
-def _stage_runner(tmp_path, source):
-    """Write *source* into a 0700 staging dir, mirroring ``code_kernel._spawn``'s mkdtemp."""
-    staging = tmp_path / "staging"
-    staging.mkdir(mode=0o700)
-    runner = staging / "runner.py"
+def _fd_count(pid: int) -> int:
+    return len(os.listdir(f"/proc/{pid}/fd"))
+
+
+def _wait_for_fd_count(pid: int, ceiling: int, timeout: float = DEADLINE) -> int:
+    """Poll the broker's open-descriptor count back down to at most *ceiling*.
+
+    A ceiling rather than equality: worker threads close asynchronously, so an earlier lease
+    may still be unwinding when the baseline is sampled. A leak GROWS the count, so the
+    inequality still catches it, without turning teardown timing into a flake.
+    """
+    deadline = time.monotonic() + timeout
+    count = _fd_count(pid)
+    while time.monotonic() < deadline and count > ceiling:
+        time.sleep(0.05)
+        count = _fd_count(pid)
+    return count
+
+
+def _read_with_deadline(
+    read_fd: int, *, until_eof: bool, timeout: float = DEADLINE
+) -> bytes:
+    """Read until EOF (or one newline), failing on a deadline instead of hanging.
+
+    A bare blocking ``os.read`` here would turn the regression this file exists to catch —
+    the broker retaining a descriptor it forwarded, leaving a live writer on the peer's pipe —
+    into an indefinite hang instead of a failure. A hang is a much weaker CI signal.
+    """
+    os.set_blocking(read_fd, False)
+    chunks: list[bytes] = []
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as sel:
+        sel.register(read_fd, selectors.EVENT_READ)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                pytest.fail(
+                    "pipe never reached EOF: the broker retained a descriptor it was "
+                    f"handed (read so far: {b''.join(chunks)!r})"
+                )
+            if not sel.select(remaining):
+                continue
+            chunk = os.read(read_fd, 4096)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            if not until_eof and b"\n" in chunk:
+                return b"".join(chunks).split(b"\n", 1)[0]
+
+
+def _child_report(read_fd: int) -> dict:
+    """Read the child's JSON report off the SCM_RIGHTS pipe.
+
+    The empty-read guard matters: a child that never ran (or died before writing) closes its
+    copy and yields EOF, and a bare ``json.loads`` would report that as an opaque decode
+    error instead of naming what actually happened.
+    """
+    raw = _read_with_deadline(read_fd, until_eof=True)
+    assert raw, "the child produced no report: it never ran, or died before writing"
+    return json.loads(raw)
+
+
+def _stage_runner(root, name, source):
+    """Write *source* into the staging root, mirroring ``code_kernel._spawn``'s mkdtemp."""
+    runner = Path(root) / name
     runner.write_text(textwrap.dedent(source), encoding="utf-8")
-    return staging, runner
+    return runner
+
+
+def _staging_root(tmp_path):
+    root = tmp_path / "staging"
+    root.mkdir(mode=0o700)
+    return root
+
+
+def _launch_body(path):
+    return json.dumps({"op": "launch", "runner": str(path), "env": {}}).encode() + b"\n"
+
+
+def _raw_request(sock_path: str, body: bytes, fds: list):
+    """Send a request the client helper would never construct; return the parsed reply.
+
+    Returns ``None`` if the broker closed the connection without saying anything — which is
+    itself a finding: every refusal must be a structured reply, not a silent hangup.
+    """
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(DEADLINE)
+    try:
+        conn.connect(sock_path)
+        ancillary = (
+            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))]
+            if fds
+            else []
+        )
+        conn.sendmsg([body], ancillary)
+        buf = b""
+        while b"\n" not in buf:
+            data = conn.recv(4096)
+            if not data:
+                break
+            buf += data
+        return json.loads(buf.split(b"\n", 1)[0]) if b"\n" in buf else None
+    finally:
+        conn.close()
 
 
 @pytest.mark.linux_only
-def test_brokered_child_gets_approved_env_and_scm_rights_fd_without_opening_staging_dir(
+def test_broker_transports_approved_resources_and_refuses_invalid_requests_without_leaking_fds(
     tmp_path,
 ):
-    """One launch proves all three transports the sudo carrier severed."""
+    """Transport + protocol: what crosses the boundary, what is refused, and who owns an fd.
+
+    The accepted launch witnesses all three transports the ``sudo`` carrier severed, and
+    witnesses them by MECHANISM, not by side effect: the child reports the inode behind its
+    own ``/proc/self/fd`` argv, so a broker that handed over a plain filesystem path instead
+    would fail. Every refusal then has to close the descriptors it was handed — the peer's
+    pipe reaching EOF is the only proof the broker is not holding its channel open.
+    """
     broker = _load_broker()
-    staging, runner = _stage_runner(
-        tmp_path,
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(
+        root,
+        "runner.py",
         """
-        import os
+        import json, os, sys
         fd = int(os.environ["HERMES_BROKER_FDS"].split(",")[0])
-        approved = os.environ.get("BROKER_PROBE_APPROVED", "<missing>")
-        host_only = "LEAKED" if "BROKER_PROBE_HOST_ONLY" in os.environ else "clean"
-        os.write(fd, ("%s|%s" % (approved, host_only)).encode())
+        os.write(fd, json.dumps({
+            "approved": os.environ.get("BROKER_PROBE_APPROVED", "<missing>"),
+            "host_only_leaked": "BROKER_PROBE_HOST_ONLY" in os.environ,
+            "argv0": sys.argv[0],
+            "runner_inode": os.stat(sys.argv[0]).st_ino,
+            "stderr_target": os.readlink("/proc/self/fd/2"),
+        }).encode())
     """,
     )
-    proc, sock_path = _start_broker("host-only-secret")
-    read_fd, write_fd = os.pipe()
+    outside = tmp_path / "outside.py"
+    outside.write_text("raise SystemExit(0)\n", encoding="utf-8")
+    escape = root / "escape.py"
+    escape.symlink_to(outside)
+
+    proc, sock_path = _start_broker("host-only-secret", root)
     try:
-        conn, reply = broker.request_launch(
-            sock_path,
-            runner=str(runner),
-            env={"BROKER_PROBE_APPROVED": "approved-value-42"},
-            fds=[write_fd],
-        )
+        # --- accepted launch: env, descriptor and runner all arrive explicitly -----------
+        read_fd, write_fd = os.pipe()
         try:
-            assert reply["ok"] is True
+            conn, reply = broker.request_launch(
+                sock_path,
+                runner=str(runner),
+                env={"BROKER_PROBE_APPROVED": "approved-value-42"},
+                fds=[write_fd],
+            )
+            try:
+                assert reply["ok"] is True
+                os.close(write_fd)
+                write_fd = -1
+                # The broker resolved and opened the runner before replying, so sealing the
+                # staging dir now witnesses the /proc/self/fd hand-off: a child that had to
+                # traverse the directory itself could no longer reach the file.
+                os.chmod(root, 0o000)
+                report = _child_report(read_fd)
+            finally:
+                os.chmod(root, 0o700)
+                conn.close()
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+        # (a) the approved value arrived; the broker's own environment did not.
+        assert report["approved"] == "approved-value-42"
+        assert report["host_only_leaked"] is False
+        # (b) the runner crossed as a descriptor, not as a path: argv[0] is the broker's own
+        #     open fd, and it resolves to the staged file's inode.
+        assert report["argv0"].startswith("/proc/self/fd/")
+        assert report["runner_inode"] == runner.stat().st_ino
+        # (c) stderr is transported explicitly like stdin/stdout, not inherited from the
+        #     broker. An inherited stderr is both a log-forgery channel for a future
+        #     lower-privileged child and an undrained pipe the child can wedge itself on.
+        assert report["stderr_target"] == "/dev/null"
+
+        # --- refusals: each must be structured, and must close what it was handed --------
+        baseline = _wait_for_fd_count(proc.pid, _fd_count(proc.pid))
+        refusals = [
+            ("runner outside the staging root", _launch_body(outside), 1),
+            ("symlink escaping the staging root", _launch_body(escape), 1),
+            ("runner that does not exist", _launch_body(root / "gone.py"), 1),
+            ("body that is not JSON", b"{definitely not json\n", 1),
+            ("body that is not a launch request", b'{"op": "nope"}\n', 1),
+            (
+                "environment that is not an object",
+                json.dumps({"op": "launch", "runner": str(runner), "env": []}).encode()
+                + b"\n",
+                1,
+            ),
+            # More descriptors than one control buffer holds: the kernel truncates and sets
+            # MSG_CTRUNC, so the broker must refuse rather than launch a child whose
+            # HERMES_BROKER_FDS is silently short of what the client passed.
+            ("more descriptors than MAX_FDS", _launch_body(runner), broker.MAX_FDS + 3),
+            # A body with no newline in it at all: the cap has to be on the TOTAL received,
+            # not on one recv, or a peer can drive the broker to arbitrary memory.
+            (
+                "body larger than the request cap",
+                b"x" * (broker.MAX_REQUEST_BYTES + 4096),
+                1,
+            ),
+        ]
+        for label, body, fd_copies in refusals:
+            read_fd, write_fd = os.pipe()
+            try:
+                reply = _raw_request(sock_path, body, [write_fd] * fd_copies)
+                os.close(write_fd)
+                write_fd = -1
+                assert reply is not None, f"{label}: broker closed without a reply"
+                assert reply["ok"] is False, f"{label}: broker accepted the request"
+                assert reply["error"], f"{label}: reply carries no error code"
+                assert reply["message"], f"{label}: reply carries no message"
+                assert _read_with_deadline(read_fd, until_eof=True) == b"", label
+            finally:
+                os.close(read_fd)
+                if write_fd != -1:
+                    os.close(write_fd)
+
+        # Repeating the cheapest refusal exercises the accumulation the per-arm EOF check
+        # cannot see: a per-request fd leak ends at RLIMIT_NOFILE, not at one bad request.
+        for _ in range(40):
+            _raw_request(sock_path, _launch_body(root / "gone.py"), [])
+        assert _wait_for_fd_count(proc.pid, baseline) <= baseline
+
+        # --- and the broker still works -------------------------------------------------
+        read_fd, write_fd = os.pipe()
+        try:
+            conn, reply = broker.request_launch(
+                sock_path, runner=str(runner), env={}, fds=[write_fd]
+            )
             os.close(write_fd)
             write_fd = -1
-            # EOF only arrives once the broker has closed its own copy of the descriptor,
-            # so reading to EOF also proves the broker does not retain what it forwards.
-            chunks = []
-            while chunk := os.read(read_fd, 4096):
-                chunks.append(chunk)
-        finally:
+            assert reply["ok"] is True
+            report = _child_report(read_fd)
+            assert report["approved"] == "<missing>"
             conn.close()
-    finally:
-        os.close(read_fd)
-        if write_fd != -1:
-            os.close(write_fd)
-        proc.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=5)
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
 
-    # (a) the approved value arrived; the broker's own environment did not.
-    # (b) the only channel the child could have reported on is the SCM_RIGHTS descriptor:
-    #     the pipe has no filesystem name, so the broker learned of it no other way.
-    assert b"".join(chunks).decode() == "approved-value-42|clean"
-    # (c) the runner ran, and its directory is still owner-only.
-    assert stat.S_IMODE(staging.stat().st_mode) == 0o700
+        # A refused request must also be a typed failure on the client, not a JSONDecodeError
+        # escaping from inside the helper (which would also strand the client's own socket).
+        with pytest.raises(broker.BrokerError) as excinfo:
+            broker.request_launch(sock_path, runner=str(outside), env={}, fds=[])
+        assert excinfo.value.code == "runner_outside_root"
+    finally:
+        _stop_broker(proc)
 
 
 @pytest.mark.linux_only
 def test_brokered_child_is_terminated_when_the_client_connection_disappears(tmp_path):
-    """The client connection is the child's lease: its EOF tears the child down.
+    """Lease lifetime: nothing outlives its lease, and nothing pins a worker forever.
 
-    This is the broker-owned replacement for the inherited parent-death pipe that ``sudo``
-    closes — the liveness signal crosses the boundary explicitly instead of by inheritance.
+    The client connection is the broker-owned replacement for the inherited parent-death pipe
+    that ``sudo`` closes — the liveness signal crosses the boundary explicitly instead of by
+    inheritance. That only holds if it holds for the whole process GROUP (a code kernel or a
+    bash runner spawns descendants), for the broker's own shutdown (a lease whose owner dies
+    still has to reap), and in the other direction too: a child that exits on its own, or a
+    peer that never sends a request, must not park a worker thread forever.
     """
     broker = _load_broker()
-    _staging, runner = _stage_runner(
-        tmp_path,
+    root = _staging_root(tmp_path)
+    # Spawns a grandchild in the SAME process group, then reports both pids. A broker that
+    # signalled only proc.pid instead of the group would leak the grandchild.
+    group_runner = _stage_runner(
+        root,
+        "group_runner.py",
         """
-        import os, time
+        import json, os, subprocess, sys, time
         fd = int(os.environ["HERMES_BROKER_FDS"].split(",")[0])
-        os.write(fd, b"ready")
+        kid = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        os.write(fd, (json.dumps({"child": os.getpid(), "grandchild": kid.pid}) + "\\n").encode())
         time.sleep(600)
     """,
     )
-    proc, sock_path = _start_broker("host-only-secret")
-    read_fd, write_fd = os.pipe()
-    child_pid = None
+    quick_runner = _stage_runner(
+        root,
+        "quick_runner.py",
+        """
+        import os
+        fd = int(os.environ["HERMES_BROKER_FDS"].split(",")[0])
+        os.write(fd, b"bye\\n")
+    """,
+    )
+    proc, sock_path = _start_broker("host-only-secret", root)
+    doomed: list = []
     try:
-        conn, reply = broker.request_launch(
-            sock_path, runner=str(runner), env={}, fds=[write_fd]
+        # --- a live broker owns its socket; a second broker must not steal it -------------
+        duplicate, _ = _start_broker(
+            "host-only-secret",
+            root,
+            sock_path=sock_path,
+            expect_ready=False,
         )
-        os.close(write_fd)
-        write_fd = -1
-        child_pid = reply["pid"]
-        assert os.read(read_fd, 5) == b"ready"
-        assert _pid_running(child_pid)
+        try:
+            assert duplicate.wait(timeout=HANDSHAKE_TIMEOUT) != 0, (
+                "a second broker replaced the live broker's socket"
+            )
+        finally:
+            if duplicate.poll() is None:
+                _stop_broker(duplicate)
 
-        conn.close()  # the lease disappears
+        # --- the lease governs the whole process group ----------------------------------
+        read_fd, write_fd = os.pipe()
+        try:
+            conn, reply = broker.request_launch(
+                sock_path, runner=str(group_runner), env={}, fds=[write_fd]
+            )
+            os.close(write_fd)
+            write_fd = -1
+            pids = json.loads(_read_with_deadline(read_fd, until_eof=False))
+            doomed.extend(pids.values())
+            assert reply["pid"] == pids["child"]
+            assert _pid_running(pids["child"]) and _pid_running(pids["grandchild"])
 
-        assert _wait_until_gone(child_pid, 10.0), (
-            f"child {child_pid} outlived the client connection"
+            conn.close()  # the lease disappears
+
+            assert _wait_until_gone(pids["child"]), (
+                f"child {pids['child']} outlived the client connection"
+            )
+            assert _wait_until_gone(pids["grandchild"]), (
+                f"grandchild {pids['grandchild']} survived the lease: the broker tore down "
+                "the process it spawned, not the process GROUP it leads"
+            )
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+        # --- a child that exits on its own releases the lease ---------------------------
+        # Otherwise the worker thread sits in recv until the client happens to disconnect,
+        # holding an unreaped child, and a caller polling the connection never learns the
+        # child is gone.
+        read_fd, write_fd = os.pipe()
+        try:
+            conn, reply = broker.request_launch(
+                sock_path, runner=str(quick_runner), env={}, fds=[write_fd]
+            )
+            os.close(write_fd)
+            write_fd = -1
+            assert _read_with_deadline(read_fd, until_eof=False) == b"bye"
+            conn.settimeout(DEADLINE)
+            try:
+                assert conn.recv(4096) == b""
+            except TimeoutError:
+                pytest.fail(
+                    "the broker held the lease open after the child exited: the worker "
+                    "thread is pinned until the client disconnects"
+                )
+            assert _wait_until_gone(reply["pid"]), "the exited child was never reaped"
+            conn.close()
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+        # --- a peer that never sends a request does not park a worker forever -----------
+        silent = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        silent.settimeout(DEADLINE)
+        try:
+            started = time.monotonic()
+            silent.connect(sock_path)
+            handshake = silent.recv(4096)
+            elapsed = time.monotonic() - started
+            assert handshake, "the broker closed a silent peer without saying why"
+            assert (
+                json.loads(handshake.split(b"\n", 1)[0])["error"] == "handshake_timeout"
+            )
+            assert elapsed >= HANDSHAKE_TIMEOUT, (
+                f"the broker gave up after {elapsed:.2f}s, before the handshake window"
+            )
+        finally:
+            silent.close()
+
+        # --- the broker's own SIGTERM tears down every lease it is still holding --------
+        read_fd, write_fd = os.pipe()
+        held = None
+        try:
+            held, reply = broker.request_launch(
+                sock_path, runner=str(group_runner), env={}, fds=[write_fd]
+            )
+            os.close(write_fd)
+            write_fd = -1
+            pids = json.loads(_read_with_deadline(read_fd, until_eof=False))
+            doomed.extend(pids.values())
+
+            # The lease is still HELD: only the broker's death can end it.
+            proc.send_signal(signal.SIGTERM)
+            assert proc.wait(timeout=DEADLINE) is not None
+
+            assert _wait_until_gone(pids["child"]), (
+                f"child {pids['child']} was orphaned by the broker's shutdown; "
+                "start_new_session detached it, so nothing else will ever reap it"
+            )
+            assert _wait_until_gone(pids["grandchild"]), (
+                f"grandchild {pids['grandchild']} was orphaned by the broker's shutdown"
+            )
+            assert not os.path.exists(sock_path), (
+                "the broker left its socket behind on a clean shutdown"
+            )
+        finally:
+            if held is not None:
+                held.close()
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+        # --- restart over a STALE socket, but never over something that is not one ------
+        stale_path = _socket_path()
+        killed, _ = _start_broker("host-only-secret", root, sock_path=stale_path)
+        killed.kill()
+        killed.wait(timeout=DEADLINE)
+        assert os.path.exists(stale_path), "expected an uncleaned socket after SIGKILL"
+        restarted, _ = _start_broker("host-only-secret", root, sock_path=stale_path)
+        _stop_broker(restarted)
+
+        occupied = Path(_socket_path())
+        occupied.write_text("not a socket\n", encoding="utf-8")
+        refused, _ = _start_broker(
+            "host-only-secret", root, sock_path=str(occupied), expect_ready=False
+        )
+        assert refused.wait(timeout=DEADLINE) != 0
+        assert occupied.read_text(encoding="utf-8") == "not a socket\n", (
+            "the broker unlinked a path that was not a socket"
         )
     finally:
-        os.close(read_fd)
-        if write_fd != -1:
-            os.close(write_fd)
-        if child_pid is not None and _pid_running(child_pid):
-            with contextlib.suppress(OSError):
-                os.kill(
-                    child_pid,
-                    signal.SIGKILL,  # windows-footgun: ok — linux_only test
-                )
-        proc.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=5)
+        # Best-effort sweep for a run that already failed. RuntimeError is suppressed
+        # alongside OSError because ``tests/conftest.py``'s live-system guard refuses
+        # ``os.kill`` outside the test subtree — which is precisely where an orphaned
+        # grandchild ends up. Letting it raise here would bury the assertion that failed.
+        for pid in doomed:
+            if _pid_running(pid):
+                with contextlib.suppress(OSError, RuntimeError):
+                    os.kill(
+                        pid,
+                        signal.SIGKILL,  # windows-footgun: ok — linux_only test
+                    )
+        _stop_broker(proc)
