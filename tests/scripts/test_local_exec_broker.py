@@ -75,24 +75,34 @@ def _socket_path():
     return os.path.join(tempfile.mkdtemp(prefix="hbrk_"), "b.sock")
 
 
-def _start_broker(host_only_value, staging_root, *, sock_path=None, expect_ready=True):
+def _start_broker(
+    host_only_value,
+    staging_root,
+    *,
+    sock_path=None,
+    expect_ready=True,
+    allowed_uids=None,
+):
     """Spawn the broker as its own process; return (proc, socket path).
 
     ``host_only_value`` lands in the BROKER's environment only. A child that can see it
     inherited the broker's env instead of receiving the approved one.
     """
     sock_path = sock_path or _socket_path()
+    argv = [
+        sys.executable,
+        str(BROKER_PATH),
+        "--socket",
+        sock_path,
+        "--staging-root",
+        str(staging_root),
+        "--handshake-timeout",
+        str(HANDSHAKE_TIMEOUT),
+    ]
+    for uid in allowed_uids or []:
+        argv.extend(["--allow-uid", str(uid)])
     proc = subprocess.Popen(
-        [
-            sys.executable,
-            str(BROKER_PATH),
-            "--socket",
-            sock_path,
-            "--staging-root",
-            str(staging_root),
-            "--handshake-timeout",
-            str(HANDSHAKE_TIMEOUT),
-        ],
+        argv,
         env={
             "PATH": os.environ.get("PATH", ""),
             "BROKER_PROBE_HOST_ONLY": host_only_value,
@@ -213,6 +223,74 @@ def _staging_root(tmp_path):
     root = tmp_path / "staging"
     root.mkdir(mode=0o700)
     return root
+
+
+@pytest.mark.linux_only
+def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
+    """Runner transport and peer authority are one boundary, enforced before launch."""
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(
+        root,
+        "runner.py",
+        """
+        import os
+        fd = int(os.environ["HERMES_BROKER_FDS"])
+        os.write(fd, b"launched")
+        """,
+    )
+    runner_fd = os.open(runner, os.O_RDONLY | os.O_CLOEXEC)
+    # The descriptor is the authority. After a cross-UID handoff the worker may read this
+    # already-open file but cannot reopen its inode through /proc/self/fd.
+    runner.chmod(0o000)
+    runner.unlink()
+    current_uid = os.getuid()  # windows-footgun: ok — linux_only test
+
+    allowed_proc = denied_proc = None
+    conn = None
+    read_fd, write_fd = os.pipe()
+    try:
+        allowed_proc, allowed_socket = _start_broker(
+            "host-only-secret", root, allowed_uids=[current_uid]
+        )
+        conn, reply = broker.request_launch(
+            allowed_socket,
+            runner_fd=runner_fd,
+            env={},
+            fds=[write_fd],
+        )
+        os.close(write_fd)
+        write_fd = -1
+        assert reply["ok"] is True
+        assert _read_with_deadline(read_fd, until_eof=True) == b"launched"
+        conn.close()
+        conn = None
+        _stop_broker(allowed_proc)
+        assert "Traceback" not in allowed_proc.stderr.read()
+        allowed_proc = None
+
+        denied_proc, denied_socket = _start_broker(
+            "host-only-secret", root, allowed_uids=[current_uid + 1]
+        )
+        with pytest.raises(broker.BrokerError) as excinfo:
+            broker.request_launch(
+                denied_socket,
+                runner_fd=runner_fd,
+                env={},
+                fds=[],
+            )
+        assert excinfo.value.code == "peer_uid_not_allowed"
+    finally:
+        if conn is not None:
+            conn.close()
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
+        os.close(runner_fd)
+        if allowed_proc is not None:
+            _stop_broker(allowed_proc)
+        if denied_proc is not None:
+            _stop_broker(denied_proc)
 
 
 def _launch_body(path):

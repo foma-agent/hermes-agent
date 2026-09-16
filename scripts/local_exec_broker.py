@@ -2,7 +2,8 @@
 """Local execution broker — runnable prototype for #59293. Linux/POSIX, stdlib only.
 
     python scripts/local_exec_broker.py \
-        --socket /run/user/1000/hermes-broker.sock --staging-root /run/user/1000/hermes-stage
+        --socket /run/user/1000/hermes-broker.sock --staging-root /run/user/1000/hermes-stage \
+        --allow-uid 1001 --socket-mode 0660
 
 The problem it exists to solve: the argv-only ``sudo -u`` carrier closed the same-UID policy
 escape but broke ``execute_code``, because ``sudo`` is a *privilege* tool, not a *transport*.
@@ -21,11 +22,11 @@ channel that survives a uid switch:
   descriptors   the client passes open fds over ``SCM_RIGHTS``. The broker forwards them by
                 number via ``pass_fds`` and publishes those numbers as ``HERMES_BROKER_FDS``,
                 then closes its own copies so it never holds a peer's channel open.
-  runner        the broker resolves the request against the staging root IT was configured
-                with, opens the file itself, and the child reads it back through
-                ``/proc/self/fd/<n>``. Reopening a regular file through procfs re-checks the
-                INODE bits but skips directory traversal, so the staging dir is never
-                relaxed for anyone else.
+  runner        the client passes its already-open regular runner as a distinct
+                ``SCM_RIGHTS`` descriptor. The child executes ``/proc/self/fd/<n>``, so no
+                pathname or staging-directory traversal occurs. The legacy ``runner`` path
+                request remains available for compatibility and is resolved inside the
+                broker-owned staging root before being opened.
   lifetime      the client connection IS the lease. Its EOF — close, crash, SIGKILL — is what
                 kills the child process group, the same signal shape as the inherited
                 parent-death pipe, but owned by the broker rather than inherited through sudo.
@@ -35,22 +36,19 @@ are all ``DEVNULL``, so no channel crosses the boundary by inheritance.
 
 **The request frame is the only untrusted surface, so it is the one that is bounded.** A
 request is one newline-terminated JSON object of at most ``MAX_REQUEST_BYTES`` carrying at
-most ``MAX_FDS`` descriptors, read under a handshake timeout. Every refusal is a structured
-``{"ok": false, "error", "message"}`` reply, and — the invariant that matters more — every
-refusal closes the descriptors the kernel already installed on the broker's behalf. A
-retained copy is not merely a leaked fd: it is the peer's channel, and it keeps their pipe
-from ever reaching EOF.
+most ``MAX_FDS`` child descriptors plus one runner descriptor, read under a handshake
+timeout. Every refusal is a structured ``{"ok": false, "error", "message"}`` reply, and —
+the invariant that matters more — every refusal closes the descriptors the kernel already
+installed on the broker's behalf. A retained copy is not merely a leaked fd: it is the
+peer's channel, and it keeps their pipe from ever reaching EOF.
 
-Prototype trust boundary, stated so it is not mistaken for the finished one: the socket is
-0600, the staging root must be owned by the broker uid with mode 0700, and the peer is
-therefore the broker's OWN uid. That broker-exclusive immutable-root contract is what makes
-the resolve-then-``O_NOFOLLOW`` runner open valid in this prototype; a less-trusted peer will
-require descriptor-rooted component walking. The client's ``env`` payload is passed
-to the child verbatim because at this boundary it IS the approved child environment — the
-same dict ``code_kernel._spawn`` builds today. The staging-root containment above is what
-must hold *before* that boundary moves; when the peer becomes a lower-privileged uid, this
-file additionally needs peer-credential checks (``SO_PEERCRED``) and a decision about which
-interpreter-controlling variables a less-trusted peer may set. Neither is in scope here.
+Every accepted connection is authenticated with Linux ``SO_PEERCRED`` before a request is
+read. ``--allow-uid`` is repeatable and defaults to the broker's effective uid; socket
+publication defaults to 0600, while ``--socket-mode`` can explicitly publish 0660 or 0666
+for an authorized cross-uid client. Wider publication grants only reachability: the peer uid
+allowlist remains mandatory authorization. The staging root must still be broker-owned 0700
+for legacy pathname requests. The client's ``env`` payload is passed to the child verbatim
+because at this boundary it is the approved child environment.
 
 Future integration seam (deliberately NOT wired yet, so nothing dead lands in core):
 
@@ -79,6 +77,7 @@ import selectors
 import signal
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -89,14 +88,35 @@ FDS_ENV = "HERMES_BROKER_FDS"
 
 # Caps on the one untrusted surface. These bound the TOTAL for a request, not a single recv.
 MAX_FDS = 8
+MAX_RECEIVED_FDS = MAX_FDS + 1  # one runner plus MAX_FDS child descriptors
 MAX_REQUEST_BYTES = 65536
 DEFAULT_HANDSHAKE_TIMEOUT = 10.0
 
 _INT_SIZE = array.array("i").itemsize
+_UCRED = struct.Struct("=iII")
 _RECV_CHUNK = 4096
 _TERM_GRACE_SECONDS = 2.0
 _KILL_GRACE_SECONDS = 2.0
 _PUBLISH_SUFFIXES = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_RUNNER_BOOTSTRAP = """\
+import os
+import sys
+
+_runner_fd = int(sys.argv.pop())
+_runner_path = sys.argv.pop()
+sys.argv[:] = [_runner_path]
+with os.fdopen(_runner_fd, "rb", closefd=False) as _runner:
+    _runner_code = compile(_runner.read(), _runner_path, "exec")
+exec(
+    _runner_code,
+    {
+        "__name__": "__main__",
+        "__file__": _runner_path,
+        "__package__": None,
+        "__cached__": None,
+    },
+)
+"""
 
 
 class BrokerError(RuntimeError):
@@ -114,7 +134,13 @@ class BrokerError(RuntimeError):
 
 
 def request_launch(
-    sock_path: str, *, runner: str, env: dict, fds: list, timeout: float = 30.0
+    sock_path: str,
+    *,
+    runner: str | None = None,
+    runner_fd: int | None = None,
+    env: dict,
+    fds: list,
+    timeout: float = 30.0,
 ):
     """Client side: ask the broker to launch *runner*; return ``(connection, reply)``.
 
@@ -127,11 +153,17 @@ def request_launch(
     try:
         conn.settimeout(timeout)
         conn.connect(sock_path)
-        body = (
-            json.dumps({"op": "launch", "runner": runner, "env": env}).encode("utf-8")
-            + b"\n"
-        )
-        _sendmsg_all(conn, body, _ancillary(fds))
+        if (runner is None) == (runner_fd is None):
+            raise ValueError("exactly one of runner or runner_fd is required")
+        request = {"op": "launch", "env": env}
+        rights = list(fds)
+        if runner_fd is not None:
+            request["runner_fd"] = True
+            rights.insert(0, runner_fd)
+        else:
+            request["runner"] = runner
+        body = json.dumps(request).encode("utf-8") + b"\n"
+        _sendmsg_all(conn, body, _ancillary(rights))
         reply = _read_reply(conn)
         if not reply.get("ok"):
             raise BrokerError(
@@ -205,7 +237,7 @@ def _recv_request(conn, fds: list, handshake_timeout: float):
                 raise TimeoutError
             conn.settimeout(remaining)
             msg, ancdata, flags, _addr = conn.recvmsg(
-                _RECV_CHUNK, socket.CMSG_SPACE(MAX_FDS * _INT_SIZE)
+                _RECV_CHUNK, socket.CMSG_SPACE(MAX_RECEIVED_FDS * _INT_SIZE)
             )
         except TimeoutError as exc:
             raise BrokerError(
@@ -227,12 +259,13 @@ def _recv_request(conn, fds: list, handshake_timeout: float):
         if flags & socket.MSG_CTRUNC:
             raise BrokerError(
                 "truncated_ancillary",
-                f"ancillary data was truncated; at most {MAX_FDS} descriptors per request",
+                "ancillary data was truncated; at most "
+                f"{MAX_RECEIVED_FDS} descriptors per request",
             )
-        if len(fds) > MAX_FDS:
+        if len(fds) > MAX_RECEIVED_FDS:
             raise BrokerError(
                 "too_many_fds",
-                f"at most {MAX_FDS} descriptors may be passed per request",
+                f"at most {MAX_RECEIVED_FDS} descriptors may be passed per request",
             )
         if not msg:
             raise BrokerError(
@@ -263,10 +296,16 @@ def _validated(request):
     if request.get("op") != "launch":
         raise BrokerError("bad_request", f"unsupported op {request.get('op')!r}")
     runner = request.get("runner")
-    if not isinstance(runner, str) or not runner:
-        raise BrokerError("bad_request", "'runner' must be a non-empty string")
-    if "\0" in runner:
-        raise BrokerError("bad_request", "'runner' must not contain NUL")
+    uses_runner_fd = request.get("runner_fd") is True
+    if uses_runner_fd == (runner is not None):
+        raise BrokerError(
+            "bad_request", "request must carry exactly one of 'runner' or 'runner_fd'"
+        )
+    if not uses_runner_fd:
+        if not isinstance(runner, str) or not runner:
+            raise BrokerError("bad_request", "'runner' must be a non-empty string")
+        if "\0" in runner:
+            raise BrokerError("bad_request", "'runner' must not contain NUL")
     if "env" not in request:
         env = {}
     else:
@@ -279,7 +318,7 @@ def _validated(request):
         )
     if any("\0" in key or "\0" in value for key, value in env.items()):
         raise BrokerError("bad_request", "environment entries must not contain NUL")
-    return runner, env
+    return runner, uses_runner_fd, env
 
 
 def _resolve_runner(staging_root: str, runner: str) -> str:
@@ -310,14 +349,27 @@ def _open_runner(path: str) -> int:
     return fd
 
 
+def _validate_runner_fd(fd: int) -> None:
+    """Require an open, readable regular file suitable for ``/proc/self/fd`` execution."""
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        raise BrokerError("runner_not_regular", "runner is not a regular file")
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+    if flags & getattr(os, "O_PATH", 0) or flags & os.O_ACCMODE == os.O_WRONLY:
+        raise BrokerError("runner_not_readable", "runner descriptor must be readable")
+
+
 def _launch(runner_fd: int, env: dict, fds: list):
     """Spawn the child with everything handed over explicitly."""
     child_env = dict(env)
     child_env[FDS_ENV] = ",".join(str(fd) for fd in fds)
     # pass_fds keeps each descriptor at its own number in the child, which is what makes both
     # FDS_ENV and the /proc/self/fd runner path resolvable on the far side.
+    # The bootstrap reads the already-open descriptor directly. Asking the interpreter to open
+    # ``/proc/self/fd/N`` as a script would re-check the inode's mode bits and fail after a
+    # legitimate cross-UID SCM_RIGHTS handoff, even though the descriptor itself is readable.
+    runner_path = f"/proc/self/fd/{runner_fd}"
     return subprocess.Popen(
-        [sys.executable, f"/proc/self/fd/{runner_fd}"],
+        [sys.executable, "-c", _RUNNER_BOOTSTRAP, runner_path, str(runner_fd)],
         env=child_env,
         pass_fds=(runner_fd, *fds),
         close_fds=True,
@@ -503,15 +555,41 @@ def _await_lease_end(conn, proc) -> None:
 
 
 def _serve_connection(
-    conn, staging_root: str, handshake_timeout: float, leases: _Leases
+    conn,
+    staging_root: str,
+    handshake_timeout: float,
+    leases: _Leases,
+    allowed_uids: frozenset[int] | None = None,
 ) -> None:
     proc, runner_fd = None, None
     # Descriptors the kernel installed on our behalf. One owner, one close, every path out.
     fds: list = []
     try:
         try:
-            runner, env = _recv_request(conn, fds, handshake_timeout)
-            runner_fd = _open_runner(_resolve_runner(staging_root, runner))
+            allowed_uids = allowed_uids or frozenset({os.geteuid()})
+            _pid, peer_uid, _gid = _UCRED.unpack(
+                conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)
+            )
+            if peer_uid not in allowed_uids:
+                raise BrokerError(
+                    "peer_uid_not_allowed",
+                    f"peer uid {peer_uid} is not allowed",
+                )
+            runner, uses_runner_fd, env = _recv_request(conn, fds, handshake_timeout)
+            if uses_runner_fd:
+                if not fds:
+                    raise BrokerError(
+                        "runner_fd_missing", "runner descriptor was not received"
+                    )
+                runner_fd = fds.pop(0)
+                _validate_runner_fd(runner_fd)
+            else:
+                if len(fds) > MAX_FDS:
+                    raise BrokerError(
+                        "too_many_fds",
+                        f"at most {MAX_FDS} descriptors may be passed per request",
+                    )
+                runner_fd = _open_runner(_resolve_runner(staging_root, runner))
             proc = _launch(runner_fd, env, fds)
         except BrokerError as exc:
             _reply(conn, {"ok": False, "error": exc.code, "message": exc.message})
@@ -559,6 +637,12 @@ def _validated_staging_root(path: str) -> str:
             f"{path}"
         )
     return root
+
+
+def _validated_socket_mode(mode: int) -> int:
+    if mode not in (0o600, 0o660, 0o666):
+        raise ValueError("socket mode must be 0600, 0660, or 0666")
+    return mode
 
 
 def _clear_stale_socket(sock_path: str) -> None:
@@ -671,10 +755,16 @@ def _install_shutdown(listener) -> None:
         signal.signal(sig, _shutdown)
 
 
-def _start_worker(conn, root: str, handshake_timeout: float, leases: _Leases) -> None:
+def _start_worker(
+    conn,
+    root: str,
+    handshake_timeout: float,
+    leases: _Leases,
+    allowed_uids: frozenset[int] | None = None,
+) -> None:
     worker = threading.Thread(
         target=_serve_connection,
-        args=(conn, root, handshake_timeout, leases),
+        args=(conn, root, handshake_timeout, leases, allowed_uids),
         daemon=True,
     )
     if not leases.register(conn, worker):
@@ -692,9 +782,13 @@ def serve(
     staging_root: str,
     *,
     handshake_timeout: float = DEFAULT_HANDSHAKE_TIMEOUT,
+    allowed_uids: frozenset[int] | None = None,
+    socket_mode: int = 0o600,
 ) -> None:
     """Bind, announce readiness, then serve one connection per thread."""
     root = _validated_staging_root(staging_root)
+    socket_mode = _validated_socket_mode(socket_mode)
+    allowed_uids = allowed_uids or frozenset({os.geteuid()})
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     leases = _Leases()
     owned_fd = None
@@ -726,7 +820,7 @@ def serve(
             temporary_socket = os.path.join(publish_dir, "s")
             listener.bind(f"/proc/self/fd/{lock_fd}/{suffix}/s")
             listener.listen(16)
-            os.chmod(temporary_socket, 0o600)
+            os.chmod(temporary_socket, socket_mode)
             owned_fd = os.open(
                 temporary_socket,
                 os.O_PATH
@@ -754,7 +848,7 @@ def serve(
                     time.sleep(0.05)
                     continue
                 raise
-            _start_worker(conn, root, handshake_timeout, leases)
+            _start_worker(conn, root, handshake_timeout, leases, allowed_uids)
     finally:
         with contextlib.suppress(OSError):
             listener.close()
@@ -786,8 +880,32 @@ def main(argv=None) -> int:
         default=DEFAULT_HANDSHAKE_TIMEOUT,
         help="seconds a connection may take to send one complete request",
     )
+    parser.add_argument(
+        "--allow-uid",
+        action="append",
+        type=int,
+        dest="allowed_uids",
+        help="uid authorized to request launches; repeatable (default: broker euid)",
+    )
+    parser.add_argument(
+        "--socket-mode",
+        choices=("0600", "0660", "0666"),
+        default="0600",
+        help="published socket permissions; peer uid authorization still applies",
+    )
     args = parser.parse_args(argv)
-    serve(args.socket, args.staging_root, handshake_timeout=args.handshake_timeout)
+    allowed_uids = frozenset(
+        args.allowed_uids if args.allowed_uids is not None else [os.geteuid()]
+    )
+    if any(uid < 0 for uid in allowed_uids):
+        parser.error("--allow-uid must be non-negative")
+    serve(
+        args.socket,
+        args.staging_root,
+        handshake_timeout=args.handshake_timeout,
+        allowed_uids=allowed_uids,
+        socket_mode=int(args.socket_mode, 8),
+    )
     return 0
 
 
