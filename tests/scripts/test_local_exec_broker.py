@@ -314,6 +314,27 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
             _stop_broker(denied_proc)
 
 
+@pytest.mark.linux_only
+def test_empty_uid_allowlist_denies_same_uid_peer(tmp_path):
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    client, accepted = socket.socketpair()
+    leases = broker._Leases()
+    worker = threading.Thread(
+        target=broker._serve_connection,
+        args=(accepted, str(root), 0.05, leases, frozenset()),
+    )
+    assert leases.register(accepted, worker)
+    worker.start()
+    try:
+        reply = json.loads(client.recv(4096).split(b"\n", 1)[0])
+        assert reply["error"] == "peer_uid_not_allowed"
+    finally:
+        client.close()
+        worker.join(DEADLINE)
+        assert not worker.is_alive()
+
+
 def _launch_body(path):
     return json.dumps({"op": "launch", "runner": str(path), "env": {}}).encode() + b"\n"
 
@@ -673,7 +694,10 @@ def test_fifo_runner_is_refused_without_blocking_shutdown(tmp_path):
 
 
 @pytest.mark.linux_only
-def test_transient_accept_failure_preserves_live_lease(monkeypatch, tmp_path):
+@pytest.mark.parametrize("accept_errno", [errno.EMFILE, errno.ENOBUFS, errno.ENOMEM])
+def test_transient_accept_failure_preserves_live_lease(
+    monkeypatch, tmp_path, accept_errno
+):
     broker = _load_broker()
     root = _staging_root(tmp_path)
     runner = _stage_runner(root, "runner.py", "import time; time.sleep(600)\n")
@@ -684,7 +708,7 @@ def test_transient_accept_failure_preserves_live_lease(monkeypatch, tmp_path):
     finish_accept = threading.Event()
     listener_box = []
 
-    class OneEmfileSocket(real_socket):
+    class OneTransientFailureSocket(real_socket):
         accept_calls = 0
 
         def listen(self, backlog):
@@ -695,14 +719,14 @@ def test_transient_accept_failure_preserves_live_lease(monkeypatch, tmp_path):
             type(self).accept_calls += 1
             if type(self).accept_calls == 2:
                 assert release_failure.wait(DEADLINE)
-                raise OSError(errno.EMFILE, "injected descriptor exhaustion")
+                raise OSError(accept_errno, "injected transient accept failure")
             if type(self).accept_calls == 3:
                 retry_accept.set()
                 assert finish_accept.wait(DEADLINE)
                 raise OSError(errno.EBADF, "listener closed by test")
             return super().accept()
 
-    monkeypatch.setattr(broker.socket, "socket", OneEmfileSocket)
+    monkeypatch.setattr(broker.socket, "socket", OneTransientFailureSocket)
     monkeypatch.setattr(broker, "_install_shutdown", lambda _listener: None)
     server = threading.Thread(
         target=broker.serve, args=(sock_path, str(root)), daemon=True
@@ -722,7 +746,9 @@ def test_transient_accept_failure_preserves_live_lease(monkeypatch, tmp_path):
         child_pid = reply["pid"]
         assert _pid_running(child_pid)
         release_failure.set()
-        assert retry_accept.wait(DEADLINE), "serve stopped after a transient EMFILE"
+        assert retry_accept.wait(DEADLINE), (
+            f"serve stopped after transient accept errno {accept_errno}"
+        )
         assert server.is_alive()
         assert _pid_running(child_pid), "transient accept failure drained a live lease"
     finally:

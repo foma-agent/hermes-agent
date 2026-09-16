@@ -54,6 +54,12 @@ other, and at most traverse-only for unrelated users. The staging root must stil
 broker-owned 0700 for legacy pathname requests. The client's ``env`` payload is passed to the
 child verbatim because at this boundary it is the approved child environment.
 
+Every allowlisted peer is intentionally authorized for full code execution as the broker
+uid. The broker must therefore run as the dedicated, less-privileged worker uid, never as a
+more privileged account. This direct prototype owns and cleans up only the process group it
+creates. Adversarial descendants can escape by creating another session; containing those
+requires the planned systemd/cgroup scope at integration.
+
 Future integration seam (deliberately NOT wired yet, so nothing dead lands in core):
 
   * ``tools/code_kernel.py:_spawn`` becomes a ``request_launch`` call — ``child_env`` is the
@@ -594,7 +600,8 @@ def _serve_connection(
     fds: list = []
     try:
         try:
-            allowed_uids = allowed_uids or frozenset({os.geteuid()})
+            if allowed_uids is None:
+                allowed_uids = frozenset({os.geteuid()})
             _pid, peer_uid, _gid = _UCRED.unpack(
                 conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)
             )
@@ -848,7 +855,8 @@ def serve(
     socket_dir = _validated_socket_directory(sock_path)
     root = _validated_staging_root(staging_root)
     socket_mode = _validated_socket_mode(socket_mode)
-    allowed_uids = allowed_uids or frozenset({os.geteuid()})
+    if allowed_uids is None:
+        allowed_uids = frozenset({os.geteuid()})
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     leases = _Leases()
     owned_fd = None
@@ -903,7 +911,12 @@ def serve(
                     break  # the shutdown handler closed the listener
                 if exc.errno == errno.ECONNABORTED:
                     continue
-                if exc.errno in (errno.EMFILE, errno.ENFILE):
+                if exc.errno in (
+                    errno.EMFILE,
+                    errno.ENFILE,
+                    errno.ENOBUFS,
+                    errno.ENOMEM,
+                ):
                     time.sleep(0.05)
                     continue
                 raise
