@@ -82,6 +82,7 @@ def _start_broker(
     sock_path=None,
     expect_ready=True,
     allowed_uids=None,
+    socket_mode=None,
 ):
     """Spawn the broker as its own process; return (proc, socket path).
 
@@ -101,6 +102,8 @@ def _start_broker(
     ]
     for uid in allowed_uids or []:
         argv.extend(["--allow-uid", str(uid)])
+    if socket_mode is not None:
+        argv.extend(["--socket-mode", socket_mode])
     proc = subprocess.Popen(
         argv,
         env={
@@ -240,6 +243,9 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
         """,
     )
     runner_fd = os.open(runner, os.O_RDONLY | os.O_CLOEXEC)
+    # SCM_RIGHTS carries the open description, including this deliberately hostile offset.
+    # The broker must execute the whole runner without mutating the client's cursor.
+    runner_offset = os.lseek(runner_fd, 0, os.SEEK_END)
     # The descriptor is the authority. After a cross-UID handoff the worker may read this
     # already-open file but cannot reopen its inode through /proc/self/fd.
     runner.chmod(0o000)
@@ -251,8 +257,12 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
     read_fd, write_fd = os.pipe()
     try:
         allowed_proc, allowed_socket = _start_broker(
-            "host-only-secret", root, allowed_uids=[current_uid]
+            "host-only-secret",
+            root,
+            allowed_uids=[current_uid],
+            socket_mode="0666",
         )
+        assert stat.S_IMODE(os.lstat(allowed_socket).st_mode) == 0o666
         conn, reply = broker.request_launch(
             allowed_socket,
             runner_fd=runner_fd,
@@ -263,6 +273,7 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
         write_fd = -1
         assert reply["ok"] is True
         assert _read_with_deadline(read_fd, until_eof=True) == b"launched"
+        assert os.lseek(runner_fd, 0, os.SEEK_CUR) == runner_offset
         conn.close()
         conn = None
         _stop_broker(allowed_proc)
@@ -416,7 +427,7 @@ def test_broker_launches_from_long_socket_directory(tmp_path):
         path_root,
         "d" * (107 - len(os.fsencode(path_root)) - len(os.fsencode("/b.sock")) - 1),
     )
-    os.mkdir(socket_dir)
+    os.mkdir(socket_dir, 0o700)
     sock_path = os.path.join(socket_dir, "b.sock")
     assert len(os.fsencode(sock_path)) == 107
     assert (
@@ -478,7 +489,7 @@ def test_broker_publishes_107_byte_socket_with_one_character_basename(tmp_path):
         path_root,
         "d" * (107 - len(os.fsencode(path_root)) - len(os.fsencode("/0")) - 1),
     )
-    os.mkdir(socket_dir)
+    os.mkdir(socket_dir, 0o700)
     sock_path = os.path.join(socket_dir, "0")
     assert len(os.fsencode(sock_path)) == 107
 
@@ -500,6 +511,62 @@ def test_broker_publishes_107_byte_socket_with_one_character_basename(tmp_path):
             os.rmdir(socket_dir)
         with contextlib.suppress(FileNotFoundError):
             os.rmdir(path_root)
+
+
+@pytest.mark.linux_only
+def test_broker_refuses_unreachable_socket_path(tmp_path):
+    root = _staging_root(tmp_path)
+    path_root = tempfile.mkdtemp(prefix="hbrk-overlong-")
+    socket_dir = os.path.join(
+        path_root,
+        "d" * (108 - len(os.fsencode(path_root)) - len(os.fsencode("/b.sock")) - 1),
+    )
+    os.mkdir(socket_dir, 0o700)
+    sock_path = os.path.join(socket_dir, "b.sock")
+    assert len(os.fsencode(sock_path)) == 108
+
+    proc, _ = _start_broker(
+        "host-only-secret", root, sock_path=sock_path, expect_ready=False
+    )
+    try:
+        assert proc.wait(timeout=DEADLINE) != 0
+        diagnostic = proc.stderr.read()
+        assert "AF_UNIX socket path must be at most 107 bytes" in diagnostic
+        assert "Traceback" not in diagnostic
+    finally:
+        if proc.poll() is None:
+            _stop_broker(proc)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(sock_path)
+        with contextlib.suppress(OSError):
+            os.rmdir(socket_dir)
+        with contextlib.suppress(OSError):
+            os.rmdir(path_root)
+
+
+@pytest.mark.linux_only
+def test_broker_refuses_writable_socket_directory(tmp_path):
+    root = _staging_root(tmp_path)
+    socket_dir = tempfile.mkdtemp(prefix="hbrk-writable-")
+    os.chmod(socket_dir, 0o777)
+    sock_path = os.path.join(socket_dir, "broker.sock")
+
+    proc, _ = _start_broker(
+        "host-only-secret", root, sock_path=sock_path, expect_ready=False
+    )
+    try:
+        assert proc.wait(timeout=DEADLINE) != 0
+        diagnostic = proc.stderr.read()
+        assert "socket directory must be broker-owned and not writable" in diagnostic
+        assert "Traceback" not in diagnostic
+    finally:
+        if proc.poll() is None:
+            _stop_broker(proc)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(sock_path)
+        os.chmod(socket_dir, 0o700)
+        with contextlib.suppress(OSError):
+            os.rmdir(socket_dir)
 
 
 @pytest.mark.linux_only

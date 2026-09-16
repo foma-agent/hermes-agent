@@ -2,8 +2,8 @@
 """Local execution broker — runnable prototype for #59293. Linux/POSIX, stdlib only.
 
     python scripts/local_exec_broker.py \
-        --socket /run/user/1000/hermes-broker.sock --staging-root /run/user/1000/hermes-stage \
-        --allow-uid 1001 --socket-mode 0660
+        --socket /run/hermes-broker/broker.sock --staging-root /run/hermes-worker/stage \
+        --allow-uid 1003 --socket-mode 0666
 
 The problem it exists to solve: the argv-only ``sudo -u`` carrier closed the same-UID policy
 escape but broke ``execute_code``, because ``sudo`` is a *privilege* tool, not a *transport*.
@@ -23,10 +23,12 @@ channel that survives a uid switch:
                 number via ``pass_fds`` and publishes those numbers as ``HERMES_BROKER_FDS``,
                 then closes its own copies so it never holds a peer's channel open.
   runner        the client passes its already-open regular runner as a distinct
-                ``SCM_RIGHTS`` descriptor. The child executes ``/proc/self/fd/<n>``, so no
-                pathname or staging-directory traversal occurs. The legacy ``runner`` path
-                request remains available for compatibility and is resolved inside the
-                broker-owned staging root before being opened.
+                ``SCM_RIGHTS`` descriptor. A tiny interpreter bootstrap reads that descriptor
+                with ``pread`` (not the caller's shared cursor) and compiles it with
+                ``/proc/self/fd/<n>`` as the script identity, so no pathname or staging-directory
+                traversal occurs. The legacy ``runner`` path request remains available for
+                compatibility and is resolved inside the broker-owned staging root before being
+                opened.
   lifetime      the client connection IS the lease. Its EOF — close, crash, SIGKILL — is what
                 kills the child process group, the same signal shape as the inherited
                 parent-death pipe, but owned by the broker rather than inherited through sudo.
@@ -44,11 +46,13 @@ peer's channel, and it keeps their pipe from ever reaching EOF.
 
 Every accepted connection is authenticated with Linux ``SO_PEERCRED`` before a request is
 read. ``--allow-uid`` is repeatable and defaults to the broker's effective uid; socket
-publication defaults to 0600, while ``--socket-mode`` can explicitly publish 0660 or 0666
-for an authorized cross-uid client. Wider publication grants only reachability: the peer uid
-allowlist remains mandatory authorization. The staging root must still be broker-owned 0700
-for legacy pathname requests. The client's ``env`` payload is passed to the child verbatim
-because at this boundary it is the approved child environment.
+publication defaults to 0600, while ``--socket-mode`` can explicitly publish 0660 (when the
+service and client share the socket's group) or 0666 for an authorized cross-uid client.
+Wider publication grants only reachability: the peer uid allowlist remains mandatory
+authorization. The socket directory must be owned by the broker, not writable by group or
+other, and at most traverse-only for unrelated users. The staging root must still be
+broker-owned 0700 for legacy pathname requests. The client's ``env`` payload is passed to the
+child verbatim because at this boundary it is the approved child environment.
 
 Future integration seam (deliberately NOT wired yet, so nothing dead lands in core):
 
@@ -90,6 +94,7 @@ FDS_ENV = "HERMES_BROKER_FDS"
 MAX_FDS = 8
 MAX_RECEIVED_FDS = MAX_FDS + 1  # one runner plus MAX_FDS child descriptors
 MAX_REQUEST_BYTES = 65536
+MAX_SOCKET_PATH_BYTES = 107
 DEFAULT_HANDSHAKE_TIMEOUT = 10.0
 
 _INT_SIZE = array.array("i").itemsize
@@ -105,8 +110,15 @@ import sys
 _runner_fd = int(sys.argv.pop())
 _runner_path = sys.argv.pop()
 sys.argv[:] = [_runner_path]
-with os.fdopen(_runner_fd, "rb", closefd=False) as _runner:
-    _runner_code = compile(_runner.read(), _runner_path, "exec")
+_runner_parts = []
+_runner_offset = 0
+while True:
+    _runner_chunk = os.pread(_runner_fd, 65536, _runner_offset)
+    if not _runner_chunk:
+        break
+    _runner_parts.append(_runner_chunk)
+    _runner_offset += len(_runner_chunk)
+_runner_code = compile(b"".join(_runner_parts), _runner_path, "exec")
 exec(
     _runner_code,
     {
@@ -639,6 +651,36 @@ def _validated_staging_root(path: str) -> str:
     return root
 
 
+def _validated_socket_path(path: str) -> str:
+    length = len(os.fsencode(path))
+    if length > MAX_SOCKET_PATH_BYTES:
+        raise SystemExit(
+            f"AF_UNIX socket path must be at most {MAX_SOCKET_PATH_BYTES} bytes: "
+            f"got {length}: {path}"
+        )
+    return path
+
+
+def _validated_socket_directory(path: str) -> str:
+    directory = os.path.dirname(path) or "."
+    try:
+        info = os.stat(directory, follow_symlinks=False)
+    except OSError as exc:
+        raise SystemExit(
+            f"socket directory is not accessible: {directory}: {exc}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()  # windows-footgun: ok — Linux-only broker
+        or stat.S_IMODE(info.st_mode) & 0o022
+    ):
+        raise SystemExit(
+            "socket directory must be broker-owned and not writable by group/other: "
+            f"{directory}"
+        )
+    return directory
+
+
 def _validated_socket_mode(mode: int) -> int:
     if mode not in (0o600, 0o660, 0o666):
         raise ValueError("socket mode must be 0600, 0660, or 0666")
@@ -786,6 +828,8 @@ def serve(
     socket_mode: int = 0o600,
 ) -> None:
     """Bind, announce readiness, then serve one connection per thread."""
+    sock_path = _validated_socket_path(sock_path)
+    socket_dir = _validated_socket_directory(sock_path)
     root = _validated_staging_root(staging_root)
     socket_mode = _validated_socket_mode(socket_mode)
     allowed_uids = allowed_uids or frozenset({os.geteuid()})
@@ -795,7 +839,6 @@ def serve(
     publish_dir = None
     temporary_socket = None
     try:
-        socket_dir = os.path.dirname(sock_path) or "."
         lock_fd = os.open(socket_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
