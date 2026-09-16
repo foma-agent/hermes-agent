@@ -556,6 +556,20 @@ def _reply(conn, payload: dict) -> None:
         conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
 
 
+def _await_lease_end_without_selector(conn, pid: int) -> None:
+    """Wait for lease EOF or child exit without allocating another descriptor."""
+    conn.settimeout(0.05)
+    try:
+        while not _exited_unreaped(pid):
+            try:
+                if not conn.recv(_RECV_CHUNK):
+                    return
+            except TimeoutError:
+                continue
+    finally:
+        conn.settimeout(None)
+
+
 def _await_lease_end(conn, proc) -> None:
     """Block until the lease ends — the client's EOF, or the child exiting on its own.
 
@@ -570,20 +584,19 @@ def _await_lease_end(conn, proc) -> None:
     except ProcessLookupError:
         return
     except OSError:
-        with selectors.DefaultSelector() as sel:
-            sel.register(conn, selectors.EVENT_READ)
-            while not _exited_unreaped(proc.pid):
-                if sel.select(0.05) and not conn.recv(_RECV_CHUNK):
-                    return
+        _await_lease_end_without_selector(conn, proc.pid)
         return
     try:
-        with selectors.DefaultSelector() as sel:
-            sel.register(pidfd, selectors.EVENT_READ)
-            sel.register(conn, selectors.EVENT_READ)
-            while True:
-                for key, _mask in sel.select():
-                    if key.fd == pidfd or not conn.recv(_RECV_CHUNK):
-                        return
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(pidfd, selectors.EVENT_READ)
+                sel.register(conn, selectors.EVENT_READ)
+                while True:
+                    for key, _mask in sel.select():
+                        if key.fd == pidfd or not conn.recv(_RECV_CHUNK):
+                            return
+        except OSError:
+            _await_lease_end_without_selector(conn, proc.pid)
     finally:
         os.close(pidfd)
 

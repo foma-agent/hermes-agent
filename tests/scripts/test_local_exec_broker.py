@@ -1637,6 +1637,39 @@ def test_pidfd_failure_keeps_live_client_lease_open(monkeypatch, pidfd_errno):
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize("pidfd_fails", [False, True])
+def test_selector_emfile_keeps_live_client_lease_open(monkeypatch, pidfd_fails):
+    broker = _load_broker()
+    client, conn = socket.socketpair()
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    waiter = threading.Thread(target=broker._await_lease_end, args=(conn, proc))
+    if pidfd_fails:
+        monkeypatch.setattr(
+            broker.os,
+            "pidfd_open",
+            lambda _pid: (_ for _ in ()).throw(OSError(errno.EMFILE, "injected")),
+        )
+    monkeypatch.setattr(
+        broker.selectors,
+        "DefaultSelector",
+        lambda: (_ for _ in ()).throw(OSError(errno.EMFILE, "injected")),
+    )
+    try:
+        waiter.start()
+        waiter.join(0.2)
+        assert waiter.is_alive(), "selector exhaustion was mistaken for lease EOF"
+        assert proc.poll() is None
+        client.close()
+        waiter.join(DEADLINE)
+        assert not waiter.is_alive(), "connection EOF did not end descriptor-free wait"
+    finally:
+        client.close()
+        conn.close()
+        proc.kill()
+        proc.wait(timeout=DEADLINE)
+
+
+@pytest.mark.linux_only
 def test_pidfd_enosys_preserves_sigterm_grace(monkeypatch):
     broker = _load_broker()
     read_fd, write_fd = os.pipe()
