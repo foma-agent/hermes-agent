@@ -243,6 +243,7 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
         """,
     )
     runner_fd = os.open(runner, os.O_RDONLY | os.O_CLOEXEC)
+    writable_runner_fd = os.open(runner, os.O_RDWR | os.O_CLOEXEC)
     # SCM_RIGHTS carries the open description, including this deliberately hostile offset.
     # The broker must execute the whole runner without mutating the client's cursor.
     runner_offset = os.lseek(runner_fd, 0, os.SEEK_END)
@@ -263,6 +264,14 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
             socket_mode="0666",
         )
         assert stat.S_IMODE(os.lstat(allowed_socket).st_mode) == 0o666
+        with pytest.raises(broker.BrokerError) as excinfo:
+            broker.request_launch(
+                allowed_socket,
+                runner_fd=writable_runner_fd,
+                env={},
+                fds=[],
+            )
+        assert excinfo.value.code == "runner_not_readable"
         conn, reply = broker.request_launch(
             allowed_socket,
             runner_fd=runner_fd,
@@ -298,6 +307,7 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
             os.close(write_fd)
         os.close(read_fd)
         os.close(runner_fd)
+        os.close(writable_runner_fd)
         if allowed_proc is not None:
             _stop_broker(allowed_proc)
         if denied_proc is not None:
@@ -954,6 +964,28 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
                 "bad_request",
             ),
             (
+                "environment key containing equals",
+                json.dumps({
+                    "op": "launch",
+                    "runner": str(runner),
+                    "env": {"A=B": "c"},
+                }).encode()
+                + b"\n",
+                1,
+                "bad_request",
+            ),
+            (
+                "environment value containing an unencodable surrogate",
+                json.dumps({
+                    "op": "launch",
+                    "runner": str(runner),
+                    "env": {"A": "\ud800"},
+                }).encode()
+                + b"\n",
+                1,
+                "bad_request",
+            ),
+            (
                 "environment that is not an object",
                 json.dumps({"op": "launch", "runner": str(runner), "env": []}).encode()
                 + b"\n",
@@ -963,6 +995,13 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
             (
                 "runner containing NUL",
                 json.dumps({"op": "launch", "runner": "/x/a\0b", "env": {}}).encode()
+                + b"\n",
+                1,
+                "bad_request",
+            ),
+            (
+                "runner containing an unencodable surrogate",
+                json.dumps({"op": "launch", "runner": "/x/\ud800", "env": {}}).encode()
                 + b"\n",
                 1,
                 "bad_request",

@@ -318,6 +318,12 @@ def _validated(request):
             raise BrokerError("bad_request", "'runner' must be a non-empty string")
         if "\0" in runner:
             raise BrokerError("bad_request", "'runner' must not contain NUL")
+        try:
+            os.fsencode(runner)
+        except UnicodeEncodeError as exc:
+            raise BrokerError(
+                "bad_request", "'runner' is not filesystem-encodable"
+            ) from exc
     if "env" not in request:
         env = {}
     else:
@@ -328,8 +334,18 @@ def _validated(request):
         raise BrokerError(
             "bad_request", "'env' must be a JSON object of string to string"
         )
-    if any("\0" in key or "\0" in value for key, value in env.items()):
-        raise BrokerError("bad_request", "environment entries must not contain NUL")
+    if any("\0" in key or "\0" in value or "=" in key for key, value in env.items()):
+        raise BrokerError(
+            "bad_request", "environment entries must not contain NUL or '=' in names"
+        )
+    try:
+        for key, value in env.items():
+            os.fsencode(key)
+            os.fsencode(value)
+    except UnicodeEncodeError as exc:
+        raise BrokerError(
+            "bad_request", "environment entries must be OS-encodable"
+        ) from exc
     return runner, uses_runner_fd, env
 
 
@@ -366,8 +382,8 @@ def _validate_runner_fd(fd: int) -> None:
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         raise BrokerError("runner_not_regular", "runner is not a regular file")
     flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-    if flags & getattr(os, "O_PATH", 0) or flags & os.O_ACCMODE == os.O_WRONLY:
-        raise BrokerError("runner_not_readable", "runner descriptor must be readable")
+    if flags & getattr(os, "O_PATH", 0) or flags & os.O_ACCMODE != os.O_RDONLY:
+        raise BrokerError("runner_not_readable", "runner descriptor must be read-only")
 
 
 def _launch(runner_fd: int, env: dict, fds: list):
