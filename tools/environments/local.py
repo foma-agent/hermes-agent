@@ -40,12 +40,14 @@ logger = logging.getLogger(__name__)
 class _BrokerProcessHandle:
     """ProcessHandle backed by the broker connection that owns the child lease."""
 
-    def __init__(self, conn, pid: int, stdout_fd: int, stdin_fd: int | None):
+    def __init__(
+        self, conn, pid: int, stdout_fd: int, stdin_fd: int | None, remainder: bytes = b""
+    ):
         self._conn = conn
         self.pid = pid
         self._returncode = None
         self._failure = None
-        self._reply = b""
+        self._reply = remainder
         self._poll_lock = threading.Lock()
         self.stdout = os.fdopen(stdout_fd, "r", encoding="utf-8", errors="replace")
         self.stdin = (
@@ -65,28 +67,40 @@ class _BrokerProcessHandle:
                 raise self._failure
             if self._returncode is not None:
                 return self._returncode
-            try:
-                chunk = self._conn.recv(4096)
-            except BlockingIOError:
-                return None
-            if chunk:
-                self._reply += chunk
-                if b"\n" not in self._reply:
+            if b"\n" not in self._reply:
+                try:
+                    chunk = self._conn.recv(4096)
+                except BlockingIOError:
                     return None
+                if chunk:
+                    self._reply += chunk
+                    if b"\n" not in self._reply:
+                        return None
+                else:
+                    self._conn.close()
+                    self._failure = EnvironmentConnectionError(
+                        "configured local execution broker failed during command execution",
+                        retry_hint=(
+                            "Restart the operator-owned broker service and retry the command."
+                        ),
+                    )
+                    raise self._failure
+            if b"\n" in self._reply:
                 import json
 
-                reply = json.loads(self._reply.split(b"\n", 1)[0])
-                self._returncode = int(reply["exit"])
+                try:
+                    reply = json.loads(self._reply.split(b"\n", 1)[0])
+                    self._returncode = int(reply["exit"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    self._conn.close()
+                    self._failure = EnvironmentConnectionError(
+                        f"configured local execution broker returned an invalid exit reply: {exc}",
+                        retry_hint=(
+                            "Restart the operator-owned broker service and retry the command."
+                        ),
+                    )
+                    raise self._failure from exc
                 self._conn.close()
-            else:
-                self._conn.close()
-                self._failure = EnvironmentConnectionError(
-                    "configured local execution broker failed during command execution",
-                    retry_hint=(
-                        "Restart the operator-owned broker service and retry the command."
-                    ),
-                )
-                raise self._failure
             return self._returncode
 
     def wait(self, timeout=None):
@@ -877,7 +891,7 @@ class LocalEnvironment(BaseEnvironment):
             if stdin_data is not None:
                 stdin_r, stdin_w = os.pipe()
             try:
-                conn, reply = request_launch(
+                conn, reply, remainder = request_launch(
                     self._local_exec_broker_socket,
                     argv=args,
                     cwd=self.cwd,
@@ -897,7 +911,7 @@ class LocalEnvironment(BaseEnvironment):
                 if stdin_r is not None:
                     os.close(stdin_r)
                     stdin_r = None
-                proc = _BrokerProcessHandle(conn, pid, stdout_r, stdin_w)
+                proc = _BrokerProcessHandle(conn, pid, stdout_r, stdin_w, remainder)
             except BaseException as exc:
                 if conn is not None:
                     with contextlib.suppress(OSError):

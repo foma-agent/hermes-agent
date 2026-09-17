@@ -385,7 +385,7 @@ def test_local_environment_closes_lease_when_broker_reply_is_malformed(
     baseline = _fd_count(os.getpid())
 
     def malformed_launch(*_args, **_kwargs):
-        return client, {"ok": True}
+        return client, {"ok": True}, b""
 
     monkeypatch.setattr(broker, "request_launch", malformed_launch)
     try:
@@ -460,6 +460,87 @@ def test_local_environment_configured_broker_failure_never_falls_back(
 
 
 @pytest.mark.linux_only
+def test_request_launch_preserves_coalesced_exit_frame(monkeypatch):
+    """A launch reply and exit frame from one recv must cross into the process handle."""
+    broker = _load_broker()
+    from tools.environments.local import _BrokerProcessHandle
+
+    class CoalescedConnection:
+        closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendmsg(self, buffers, _ancillary):
+            return len(buffers[0])
+
+        def recv(self, _size):
+            return b'{"ok": true, "pid": 123}\n{"exit": 7}\n'
+
+        def setblocking(self, _blocking):
+            pass
+
+        def close(self):
+            self.closed = True
+
+    conn = CoalescedConnection()
+    monkeypatch.setattr(broker.socket, "socket", lambda *_args: conn)
+
+    returned_conn, reply, remainder = broker.request_launch(
+        "test-only", argv=["true"], cwd="/", env={}, fds=[]
+    )
+
+    assert returned_conn is conn
+    assert reply == {"ok": True, "pid": 123}
+    assert remainder == b'{"exit": 7}\n'
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    handle = _BrokerProcessHandle(conn, reply["pid"], read_fd, None, remainder)
+    try:
+        assert handle.poll() == 7
+        assert conn.closed
+    finally:
+        handle.stdout.close()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("remainder", (b"not-json\n", b'{"status": 7}\n'))
+def test_broker_process_poll_rejects_malformed_buffered_exit_frame(remainder):
+    """Malformed buffered status is a typed broker failure that closes its lease."""
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.environments.local import _BrokerProcessHandle
+
+    class Connection:
+        closed = False
+
+        def setblocking(self, _blocking):
+            pass
+
+        def recv(self, _size):
+            pytest.fail("a complete buffered frame must be parsed before recv")
+
+        def close(self):
+            self.closed = True
+
+    conn = Connection()
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    handle = _BrokerProcessHandle(conn, 123, read_fd, None, remainder)
+    try:
+        with pytest.raises(
+            EnvironmentConnectionError,
+            match="invalid exit reply",
+        ):
+            handle.poll()
+        assert conn.closed
+    finally:
+        handle.stdout.close()
+
+
+@pytest.mark.linux_only
 def test_broker_process_poll_does_not_overwrite_exit_status_during_concurrent_poll():
     """The wait loop and stdout drainer may poll together; EOF cannot erase the exit frame."""
     from tools.environments.local import _BrokerProcessHandle
@@ -527,7 +608,7 @@ def test_runner_fd_launch_routes_explicit_stdout_descriptor(tmp_path):
     read_fd, write_fd = os.pipe()
     conn = None
     try:
-        conn, reply = broker.request_launch(
+        conn, reply, _remainder = broker.request_launch(
             sock_path,
             runner_fd=runner_fd,
             env={},
@@ -593,7 +674,7 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
                 fds=[],
             )
         assert excinfo.value.code == "runner_not_readable"
-        conn, reply = broker.request_launch(
+        conn, reply, _remainder = broker.request_launch(
             allowed_socket,
             runner_fd=runner_fd,
             env={},
@@ -912,7 +993,7 @@ def test_broker_launches_from_long_socket_directory(tmp_path):
     try:
         proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
         broker = _load_broker()
-        conn, reply = broker.request_launch(
+        conn, reply, _remainder = broker.request_launch(
             sock_path, runner=str(runner), env={}, fds=[]
         )
         assert reply["ok"] is True
@@ -939,7 +1020,7 @@ def test_broker_launches_when_socket_basename_is_publication_suffix(tmp_path):
     try:
         proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
         broker = _load_broker()
-        conn, reply = broker.request_launch(
+        conn, reply, _remainder = broker.request_launch(
             sock_path, runner=str(runner), env={}, fds=[]
         )
         assert reply["ok"] is True
@@ -970,7 +1051,7 @@ def test_broker_publishes_107_byte_socket_with_one_character_basename(tmp_path):
     try:
         proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
         broker = _load_broker()
-        conn, reply = broker.request_launch(
+        conn, reply, _remainder = broker.request_launch(
             sock_path, runner=str(runner), env={}, fds=[]
         )
         assert reply["ok"] is True
@@ -1069,7 +1150,7 @@ def test_publication_slots_reclaim_only_stale_broker_sockets(tmp_path, request):
     sock_path = os.path.join(socket_dir, "broker.sock")
     try:
         proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
-        conn, reply = broker.request_launch(
+        conn, reply, _remainder = broker.request_launch(
             sock_path, runner=str(runner), env={}, fds=[]
         )
         assert reply["ok"] is True
@@ -1181,7 +1262,7 @@ def test_transient_accept_failure_preserves_live_lease(
     conn = None
     child_pid = None
     try:
-        conn, reply = broker.request_launch(
+        conn, reply, _remainder = broker.request_launch(
             sock_path, runner=str(runner), env={}, fds=[]
         )
         child_pid = reply["pid"]
@@ -1360,7 +1441,7 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
         # --- accepted launch: env, descriptor and runner all arrive explicitly -----------
         read_fd, write_fd = os.pipe()
         try:
-            conn, reply = broker.request_launch(
+            conn, reply, _remainder = broker.request_launch(
                 sock_path,
                 runner=str(runner),
                 env={"BROKER_PROBE_APPROVED": "approved-value-42"},
@@ -1569,7 +1650,7 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
         # --- and the broker still works -------------------------------------------------
         read_fd, write_fd = os.pipe()
         try:
-            conn, reply = broker.request_launch(
+            conn, reply, _remainder = broker.request_launch(
                 sock_path, runner=str(runner), env={}, fds=[write_fd]
             )
             os.close(write_fd)
@@ -1665,7 +1746,7 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
         # --- the lease governs the whole process group ----------------------------------
         read_fd, write_fd = os.pipe()
         try:
-            conn, reply = broker.request_launch(
+            conn, reply, _remainder = broker.request_launch(
                 sock_path, runner=str(group_runner), env={}, fds=[write_fd]
             )
             os.close(write_fd)
@@ -1695,7 +1776,7 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
         # child is gone.
         read_fd, write_fd = os.pipe()
         try:
-            conn, reply = broker.request_launch(
+            conn, reply, _remainder = broker.request_launch(
                 sock_path, runner=str(quick_runner), env={}, fds=[write_fd]
             )
             os.close(write_fd)
@@ -1761,7 +1842,7 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
         term_leases = []
         term_reads = []
         try:
-            held, reply = broker.request_launch(
+            held, reply, _remainder = broker.request_launch(
                 sock_path, runner=str(group_runner), env={}, fds=[write_fd]
             )
             os.close(write_fd)
@@ -1771,7 +1852,7 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
 
             for _ in range(2):
                 term_read, term_write = os.pipe()
-                term_conn, term_reply = broker.request_launch(
+                term_conn, term_reply, _remainder = broker.request_launch(
                     sock_path, runner=str(term_runner), env={}, fds=[term_write]
                 )
                 os.close(term_write)

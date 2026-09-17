@@ -168,7 +168,7 @@ def request_launch(
     stdout_fd: int | None = None,
     timeout: float = 30.0,
 ):
-    """Client side: ask the broker to launch *runner*; return ``(connection, reply)``.
+    """Ask the broker to launch *runner*; return ``(connection, reply, remainder)``.
 
     The caller MUST hold the returned connection open for as long as the child should
     live — the broker treats its EOF as the order to tear the child down. On any failure the
@@ -202,7 +202,7 @@ def request_launch(
                 rights.append(fd)
         body = json.dumps(request).encode("utf-8") + b"\n"
         _sendmsg_all(conn, body, _ancillary(rights))
-        reply = _read_reply(conn)
+        reply, remainder = _read_reply(conn)
         if not reply.get("ok"):
             raise BrokerError(
                 reply.get("error") or "unknown",
@@ -211,7 +211,7 @@ def request_launch(
     except BaseException:
         conn.close()
         raise
-    return conn, reply
+    return conn, reply, remainder
 
 
 def _ancillary(fds):
@@ -234,7 +234,7 @@ def _sendmsg_all(conn, body: bytes, ancillary) -> None:
         first = False
 
 
-def _read_reply(conn) -> dict:
+def _read_reply(conn) -> tuple[dict, bytes]:
     """Read one newline-terminated reply frame (no ancillary data expected)."""
     buf = b""
     while b"\n" not in buf:
@@ -247,7 +247,8 @@ def _read_reply(conn) -> dict:
         if len(buf) > MAX_REQUEST_BYTES:
             raise BrokerError("bad_reply", "broker reply exceeded the frame cap")
     try:
-        return json.loads(buf.split(b"\n", 1)[0])
+        frame, remainder = buf.split(b"\n", 1)
+        return json.loads(frame), remainder
     except json.JSONDecodeError as exc:
         raise BrokerError("bad_reply", f"broker reply was not JSON: {exc}") from exc
 
