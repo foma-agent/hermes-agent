@@ -934,11 +934,17 @@ class ProcessRegistry(ProcessCheckpointMixin):
         temp_dir = self._env_temp_dir(env)
         log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
         q = shlex.quote
+        worker = (
+            f"bash -lc {q(command)} > {q(log_path)} 2>&1; "
+            f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)}"
+        )
+        if _IS_LINUX and getattr(env, "_local_exec_broker_socket", None):
+            launcher = f"nohup setsid bash -c {q(worker)}"
+        else:
+            launcher = f"( nohup {worker} )"
         bg_command = (
-            f"mkdir -p {q(temp_dir)} && "
-            f"( nohup bash -lc {q(command)} > {q(log_path)} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
-            f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
+            f"mkdir -p {q(temp_dir)} && {{ {launcher} & "
+            f"echo $! > {q(pid_path)} && cat {q(pid_path)}; }}")
         try:
             result = env.execute(bg_command, timeout=timeout, rewrite_compound_background=False)
             output = result.get("output", "").strip()

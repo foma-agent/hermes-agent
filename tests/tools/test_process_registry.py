@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -773,6 +774,46 @@ class TestSpawnEnvSanitization:
         fake_thread.start.assert_not_called()
         # A failed launch must not be exposed as a running/tracked session.
         assert session.id not in registry._running
+
+    @pytest.mark.linux_only
+    @pytest.mark.live_system_guard_bypass
+    def test_spawn_via_env_escapes_configured_local_broker_lease(
+        self, registry, tmp_path
+    ):
+        """The real hermes_bg launcher, and only it, starts a distinct session."""
+        class FakeLocalBrokerEnv:
+            _local_exec_broker_socket = "/run/hermes-broker/broker.sock"
+
+            def get_temp_dir(self):
+                return str(tmp_path)
+
+            def execute(self, command, **_kwargs):
+                proc = subprocess.Popen(
+                    ["/bin/bash", "-c", command],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                output = proc.stdout.readline()
+                proc.stdout.close()
+                return {"output": output, "returncode": proc.wait(timeout=5)}
+
+        env = FakeLocalBrokerEnv()
+        fake_thread = MagicMock()
+
+        session = None
+        try:
+            with patch("tools.process_registry.threading.Thread", return_value=fake_thread), \
+                patch.object(registry, "_write_checkpoint"):
+                session = registry.spawn_via_env(env, "sleep 300")
+
+            assert session.pid is not None
+            assert os.getsid(session.pid) == session.pid
+            fake_thread.start.assert_called_once()
+        finally:
+            if session is not None and session.pid is not None:
+                with suppress(ProcessLookupError):
+                    os.killpg(session.pid, signal.SIGKILL)
 
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")

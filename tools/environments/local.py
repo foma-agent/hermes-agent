@@ -63,16 +63,38 @@ class _BrokerProcessHandle:
 
     def poll(self):
         with self._poll_lock:
+            from scripts.local_exec_broker import MAX_REPLY_BYTES
+
             if self._failure is not None:
                 raise self._failure
             if self._returncode is not None:
                 return self._returncode
+            if b"\n" not in self._reply and len(self._reply) > MAX_REPLY_BYTES:
+                self._reply = b""
+                self._conn.close()
+                self._failure = EnvironmentConnectionError(
+                    "configured local execution broker returned an oversized exit reply",
+                    retry_hint=(
+                        "Restart the operator-owned broker service and retry the command."
+                    ),
+                )
+                raise self._failure
             if b"\n" not in self._reply:
                 try:
                     chunk = self._conn.recv(4096)
                 except BlockingIOError:
                     return None
                 if chunk:
+                    if len(self._reply) + len(chunk) > MAX_REPLY_BYTES:
+                        self._reply = b""
+                        self._conn.close()
+                        self._failure = EnvironmentConnectionError(
+                            "configured local execution broker returned an oversized exit reply",
+                            retry_hint=(
+                                "Restart the operator-owned broker service and retry the command."
+                            ),
+                        )
+                        raise self._failure
                     self._reply += chunk
                     if b"\n" not in self._reply:
                         return None
@@ -920,6 +942,13 @@ class LocalEnvironment(BaseEnvironment):
                     if fd is not None:
                         with contextlib.suppress(OSError):
                             os.close(fd)
+                if isinstance(exc, BrokerError) and exc.code == "request_too_large":
+                    raise EnvironmentConnectionError(
+                        f"local execution broker request is too large: {exc.message}",
+                        retry_hint=(
+                            "Reduce the command or environment payload before retrying."
+                        ),
+                    ) from exc
                 if isinstance(exc, (BrokerError, OSError)):
                     raise EnvironmentConnectionError(
                         f"configured local execution broker is unavailable: {exc}",

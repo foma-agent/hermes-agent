@@ -103,13 +103,17 @@ FDS_ENV = "HERMES_BROKER_FDS"
 # Caps on the one untrusted surface. These bound the TOTAL for a request, not a single recv.
 MAX_FDS = 8
 MAX_RECEIVED_FDS = MAX_FDS + 1  # one runner plus MAX_FDS child descriptors
-MAX_REQUEST_BYTES = 65536
+# Linux permits roughly 2 MiB across argv+env and expands non-ASCII JSON characters to as
+# many as six bytes. Keep the protocol bounded while leaving room for every kernel-admissible
+# launch plus its JSON structure. Replies remain tiny and keep their own tighter cap.
+MAX_REQUEST_BYTES = 16 * 1024 * 1024
+MAX_REPLY_BYTES = 65536
 MAX_SOCKET_PATH_BYTES = 107
 DEFAULT_HANDSHAKE_TIMEOUT = 10.0
 
 _INT_SIZE = array.array("i").itemsize
 _UCRED = struct.Struct("=iII")
-_RECV_CHUNK = 4096
+_RECV_CHUNK = 65536
 _TERM_GRACE_SECONDS = 2.0
 _KILL_GRACE_SECONDS = 2.0
 _PUBLISH_SUFFIXES = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -177,8 +181,6 @@ def request_launch(
     """
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
-        conn.settimeout(timeout)
-        conn.connect(sock_path)
         launch_kinds = sum((
             runner is not None,
             runner_fd is not None,
@@ -201,6 +203,15 @@ def request_launch(
                 request[name] = len(rights)
                 rights.append(fd)
         body = json.dumps(request).encode("utf-8") + b"\n"
+        if len(body) > MAX_REQUEST_BYTES:
+            raise BrokerError(
+                "request_too_large",
+                f"launch request exceeds the {MAX_REQUEST_BYTES}-byte frame limit",
+            )
+        socket_info = _validated_client_socket(sock_path)
+        conn.settimeout(timeout)
+        conn.connect(sock_path)
+        _authenticate_broker_peer(conn, sock_path, socket_info)
         _sendmsg_all(conn, body, _ancillary(rights))
         reply, remainder = _read_reply(conn)
         if not reply.get("ok"):
@@ -212,6 +223,59 @@ def request_launch(
         conn.close()
         raise
     return conn, reply, remainder
+
+
+def _validated_client_socket(sock_path: str):
+    """Return the trusted socket identity required by the documented deployment."""
+    directory = os.path.dirname(sock_path) or "."
+    try:
+        directory_info = os.lstat(directory)
+        socket_info = os.lstat(sock_path)
+    except OSError as exc:
+        raise BrokerError(
+            "peer_authentication_failed",
+            f"could not inspect broker socket ownership: {exc}",
+        ) from exc
+    if (
+        not stat.S_ISDIR(directory_info.st_mode)
+        or stat.S_IMODE(directory_info.st_mode) & 0o022
+    ):
+        raise BrokerError(
+            "peer_authentication_failed",
+            "broker socket directory must not be writable by group or other",
+        )
+    if not stat.S_ISSOCK(socket_info.st_mode):
+        raise BrokerError(
+            "peer_authentication_failed", "configured broker path is not a socket"
+        )
+    if socket_info.st_uid != directory_info.st_uid:
+        raise BrokerError(
+            "peer_authentication_failed",
+            "broker socket and its directory have different owners",
+        )
+    return socket_info
+
+
+def _authenticate_broker_peer(conn, sock_path: str, socket_info) -> None:
+    """Bind the connected Linux peer to the pre-connect filesystem identity."""
+    try:
+        current = os.lstat(sock_path)
+        _pid, peer_uid, _gid = _UCRED.unpack(
+            conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UCRED.size)
+        )
+    except (OSError, struct.error) as exc:
+        raise BrokerError(
+            "peer_authentication_failed", f"could not authenticate broker peer: {exc}"
+        ) from exc
+    if (current.st_dev, current.st_ino) != (socket_info.st_dev, socket_info.st_ino):
+        raise BrokerError(
+            "peer_authentication_failed", "broker socket changed while connecting"
+        )
+    if peer_uid != socket_info.st_uid:
+        raise BrokerError(
+            "peer_authentication_failed",
+            f"broker peer uid {peer_uid} does not own the configured socket",
+        )
 
 
 def _ancillary(fds):
@@ -244,7 +308,7 @@ def _read_reply(conn) -> tuple[dict, bytes]:
                 "no_reply", "broker closed the connection without replying"
             )
         buf += chunk
-        if len(buf) > MAX_REQUEST_BYTES:
+        if len(buf) > MAX_REPLY_BYTES:
             raise BrokerError("bad_reply", "broker reply exceeded the frame cap")
     try:
         frame, remainder = buf.split(b"\n", 1)
@@ -268,8 +332,9 @@ def _recv_request(conn, fds: list, handshake_timeout: float):
     path out of here.
     """
     buf = b""
+    oversized = False
     deadline = time.monotonic() + handshake_timeout
-    while b"\n" not in buf:
+    while True:
         try:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -279,6 +344,11 @@ def _recv_request(conn, fds: list, handshake_timeout: float):
                 _RECV_CHUNK, socket.CMSG_SPACE(MAX_RECEIVED_FDS * _INT_SIZE)
             )
         except TimeoutError as exc:
+            if oversized:
+                raise BrokerError(
+                    "request_too_large",
+                    f"request exceeded {MAX_REQUEST_BYTES} bytes without a frame terminator",
+                ) from exc
             raise BrokerError(
                 "handshake_timeout", "no complete request within the handshake window"
             ) from exc
@@ -310,12 +380,20 @@ def _recv_request(conn, fds: list, handshake_timeout: float):
             raise BrokerError(
                 "incomplete_request", "peer closed before sending a complete request"
             )
+        if oversized or len(buf) + len(msg) > MAX_REQUEST_BYTES:
+            # Stop retaining attacker-controlled bytes, but consume the remainder of this
+            # frame so a well-behaved peer can finish sendmsg and read the structured refusal.
+            oversized = True
+            buf = b""
+            if b"\n" in msg:
+                raise BrokerError(
+                    "request_too_large",
+                    f"request exceeded {MAX_REQUEST_BYTES} bytes before its frame terminator",
+                )
+            continue
         buf += msg
-        if len(buf) > MAX_REQUEST_BYTES:
-            raise BrokerError(
-                "request_too_large",
-                f"request exceeded {MAX_REQUEST_BYTES} bytes with no frame terminator",
-            )
+        if b"\n" in buf:
+            break
     try:
         request = json.loads(buf.split(b"\n", 1)[0])
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:

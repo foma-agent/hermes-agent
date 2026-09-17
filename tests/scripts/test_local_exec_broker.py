@@ -274,6 +274,173 @@ def test_local_environment_opt_in_executes_through_broker(tmp_path, monkeypatch)
 
 @pytest.mark.linux_only
 @pytest.mark.live_system_guard_bypass
+def test_process_registry_background_survives_foreground_broker_lease(
+    tmp_path, monkeypatch
+):
+    """The real hermes_bg entry point escapes only its worker from the command lease."""
+    from tools.environments.local import LocalEnvironment
+    from tools.process_registry import ProcessRegistry
+
+    root = _staging_root(tmp_path)
+    proc, sock_path = _start_broker(
+        "broker-only-secret", root, allowed_uids=[os.getuid()]
+    )
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    env = None
+    session = None
+    try:
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        registry = ProcessRegistry()
+        monkeypatch.setattr(registry, "_track_started", lambda *_args, **_kwargs: None)
+        session = registry.spawn_via_env(env, "sleep 300")
+
+        assert session.pid is not None
+        assert _pid_running(session.pid)
+        assert os.getsid(session.pid) == session.pid
+    finally:
+        if session is not None and session.pid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(session.pid, signal.SIGKILL)
+        if env is not None:
+            env.cleanup()
+        _stop_broker(proc)
+
+
+@pytest.mark.linux_only
+def test_local_environment_broker_accepts_kernel_sized_command_payload(
+    tmp_path, monkeypatch
+):
+    """A normal command below Linux's per-argument limit crosses the full terminal path."""
+    from tools.environments.local import LocalEnvironment
+
+    root = _staging_root(tmp_path)
+    proc, sock_path = _start_broker(
+        "broker-only-secret", root, allowed_uids=[os.getuid()]
+    )
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    env = None
+    try:
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        result = env.execute(": #" + "x" * 100_000)
+        assert result["returncode"] == 0
+    finally:
+        if env is not None:
+            env.cleanup()
+        _stop_broker(proc)
+
+
+@pytest.mark.linux_only
+def test_request_launch_rejects_oversized_frame_before_sending_payload(monkeypatch):
+    """The client reports the deliberate cap without leaking a partial request."""
+    broker = _load_broker()
+
+    class Connection:
+        closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def sendmsg(self, _buffers, _ancillary):
+            pytest.fail(
+                "an oversized request must be rejected before payload transmission"
+            )
+
+        def close(self):
+            self.closed = True
+
+    conn = Connection()
+    monkeypatch.setattr(broker, "MAX_REQUEST_BYTES", 64)
+    monkeypatch.setattr(broker.socket, "socket", lambda *_args: conn)
+
+    with pytest.raises(broker.BrokerError) as excinfo:
+        broker.request_launch(
+            "test-only", argv=["/bin/bash", "-c", "x" * 64], cwd="/", env={}, fds=[]
+        )
+
+    assert excinfo.value.code == "request_too_large"
+    assert "64-byte frame limit" in excinfo.value.message
+    assert conn.closed
+
+
+@pytest.mark.linux_only
+def test_request_launch_authenticates_peer_before_sending_payload(
+    tmp_path, monkeypatch
+):
+    """Socket ownership and SO_PEERCRED must agree before env or stdin crosses."""
+    broker = _load_broker()
+    socket_dir = tmp_path / "broker"
+    socket_dir.mkdir(mode=0o700)
+    sock_path = str(socket_dir / "broker.sock")
+    real_lstat = os.lstat
+    socket_info = os.stat_result((
+        stat.S_IFSOCK | 0o600,
+        4242,
+        1,
+        1,
+        os.geteuid(),
+        os.getegid(),
+        0,
+        0,
+        0,
+        0,
+    ))
+
+    def fake_lstat(path):
+        return socket_info if os.fspath(path) == sock_path else real_lstat(path)
+
+    class ImpostorConnection:
+        closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def getsockopt(self, _level, _kind, _size):
+            return broker._UCRED.pack(os.getpid(), os.geteuid() + 1, os.getegid())
+
+        def sendmsg(self, _buffers, _ancillary):
+            pytest.fail("peer authentication must happen before payload transmission")
+
+        def close(self):
+            self.closed = True
+
+    conn = ImpostorConnection()
+    monkeypatch.setattr(broker.os, "lstat", fake_lstat)
+    monkeypatch.setattr(broker.socket, "socket", lambda *_args: conn)
+    with pytest.raises(broker.BrokerError) as excinfo:
+        broker.request_launch(
+            sock_path,
+            argv=["/bin/true"],
+            cwd="/",
+            env={"APPROVED_SECRET": "must-not-cross"},
+            fds=[],
+        )
+
+    assert excinfo.value.code == "peer_authentication_failed"
+    assert conn.closed
+
+
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
 def test_local_environment_broker_sweeps_descendants_after_shell_exit(
     tmp_path, monkeypatch
 ):
@@ -488,6 +655,10 @@ def test_request_launch_preserves_coalesced_exit_frame(monkeypatch):
 
     conn = CoalescedConnection()
     monkeypatch.setattr(broker.socket, "socket", lambda *_args: conn)
+    monkeypatch.setattr(broker, "_validated_client_socket", lambda _path: object())
+    monkeypatch.setattr(
+        broker, "_authenticate_broker_peer", lambda _conn, _path, _info: None
+    )
 
     returned_conn, reply, remainder = broker.request_launch(
         "test-only", argv=["true"], cwd="/", env={}, fds=[]
@@ -536,6 +707,41 @@ def test_broker_process_poll_rejects_malformed_buffered_exit_frame(remainder):
         ):
             handle.poll()
         assert conn.closed
+    finally:
+        handle.stdout.close()
+
+
+@pytest.mark.linux_only
+def test_broker_process_poll_rejects_oversized_exit_frame_without_buffering():
+    """A newline-free peer reply is bounded and closes the broker lease."""
+    broker = _load_broker()
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.environments.local import _BrokerProcessHandle
+
+    class Connection:
+        closed = False
+
+        def setblocking(self, _blocking):
+            pass
+
+        def recv(self, _size):
+            return b"x" * (broker.MAX_REPLY_BYTES + 1)
+
+        def close(self):
+            self.closed = True
+
+    conn = Connection()
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    handle = _BrokerProcessHandle(conn, 123, read_fd, None)
+    try:
+        with pytest.raises(
+            EnvironmentConnectionError,
+            match="oversized exit reply",
+        ):
+            handle.poll()
+        assert conn.closed
+        assert handle._reply == b""
     finally:
         handle.stdout.close()
 
@@ -1587,11 +1793,12 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
                 broker.MAX_FDS + 3,
                 "truncated_ancillary",
             ),
-            # A body with no newline in it at all: the cap has to be on the TOTAL received,
-            # not on one recv, or a peer can drive the broker to arbitrary memory.
+            # A complete frame larger than the cap: the broker drains through the newline
+            # before replying, so a well-behaved sender gets a structured refusal instead
+            # of EPIPE while still bounding retained attacker-controlled bytes.
             (
                 "body larger than the request cap",
-                b"x" * (broker.MAX_REQUEST_BYTES + 4096),
+                b"x" * (broker.MAX_REQUEST_BYTES + 4096) + b"\n",
                 1,
                 "request_too_large",
             ),
