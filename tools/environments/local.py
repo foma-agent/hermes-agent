@@ -821,13 +821,24 @@ class LocalEnvironment(BaseEnvironment):
             broker_socket = (
                 broker_cfg.get("socket") if isinstance(broker_cfg, dict) else None
             )
+            broker_uid = broker_cfg.get("uid") if isinstance(broker_cfg, dict) else None
             if not isinstance(broker_socket, str) or not broker_socket:
                 raise EnvironmentConnectionError(
                     "terminal.local_exec_broker requires a non-empty string socket"
                 )
+            if (
+                not isinstance(broker_uid, int)
+                or isinstance(broker_uid, bool)
+                or broker_uid < 0
+            ):
+                raise EnvironmentConnectionError(
+                    "terminal.local_exec_broker requires a non-negative integer uid"
+                )
             self._local_exec_broker_socket = broker_socket
+            self._local_exec_broker_uid = broker_uid
         else:
             self._local_exec_broker_socket = None
+            self._local_exec_broker_uid = None
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -905,6 +916,7 @@ class LocalEnvironment(BaseEnvironment):
         if self._local_exec_broker_socket:
             if _IS_WINDOWS:
                 raise RuntimeError("terminal.local_exec_broker is supported only on POSIX")
+            assert self._local_exec_broker_uid is not None
             from scripts.local_exec_broker import BrokerError, request_launch
 
             stdout_r, stdout_w = os.pipe()
@@ -915,6 +927,7 @@ class LocalEnvironment(BaseEnvironment):
             try:
                 conn, reply, remainder = request_launch(
                     self._local_exec_broker_socket,
+                    expected_peer_uid=self._local_exec_broker_uid,
                     argv=args,
                     cwd=self.cwd,
                     env=_make_run_env(self.env),

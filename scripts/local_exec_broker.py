@@ -64,9 +64,9 @@ requires the planned systemd/cgroup scope at integration.
 Integration seams:
 
   * ``tools/environments/local.py:_run_bash`` now opts in when
-    ``terminal.local_exec_broker.socket`` is configured. Its argv, cwd, scrubbed environment,
-    stdin, and merged stdout/stderr cross explicitly; broker failure is fatal rather than a
-    same-uid fallback.
+    ``terminal.local_exec_broker.socket`` and ``terminal.local_exec_broker.uid`` are configured.
+    Its argv, cwd, scrubbed environment, stdin, and merged stdout/stderr cross explicitly;
+    broker failure is fatal rather than a same-uid fallback.
   * ``tools/code_kernel.py:_spawn`` remains future work: it becomes a ``request_launch`` call —
     ``child_env`` is the ``env`` payload, ``death_r`` and the runner staging dir are what this
     already transports, and the returned connection replaces ``kernel.death_pipe_w`` as the
@@ -162,6 +162,7 @@ class BrokerError(RuntimeError):
 def request_launch(
     sock_path: str,
     *,
+    expected_peer_uid: int,
     runner: str | None = None,
     runner_fd: int | None = None,
     argv: list[str] | None = None,
@@ -179,6 +180,16 @@ def request_launch(
     connection is closed here and a :class:`BrokerError` is raised; the caller never inherits
     a socket it did not get a child for.
     """
+    if (
+        not isinstance(expected_peer_uid, int)
+        or isinstance(expected_peer_uid, bool)
+        or expected_peer_uid < 0
+    ):
+        raise BrokerError(
+            "peer_authentication_failed",
+            "expected broker uid must be a non-negative integer",
+        )
+
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         launch_kinds = sum((
@@ -208,10 +219,10 @@ def request_launch(
                 "request_too_large",
                 f"launch request exceeds the {MAX_REQUEST_BYTES}-byte frame limit",
             )
-        socket_info = _validated_client_socket(sock_path)
+        socket_info = _validated_client_socket(sock_path, expected_peer_uid)
         conn.settimeout(timeout)
         conn.connect(sock_path)
-        _authenticate_broker_peer(conn, sock_path, socket_info)
+        _authenticate_broker_peer(conn, sock_path, socket_info, expected_peer_uid)
         _sendmsg_all(conn, body, _ancillary(rights))
         reply, remainder = _read_reply(conn)
         if not reply.get("ok"):
@@ -225,7 +236,7 @@ def request_launch(
     return conn, reply, remainder
 
 
-def _validated_client_socket(sock_path: str):
+def _validated_client_socket(sock_path: str, expected_peer_uid: int):
     """Return the trusted socket identity required by the documented deployment."""
     directory = os.path.dirname(sock_path) or "."
     try:
@@ -248,6 +259,12 @@ def _validated_client_socket(sock_path: str):
         raise BrokerError(
             "peer_authentication_failed", "configured broker path is not a socket"
         )
+    if socket_info.st_uid != expected_peer_uid:
+        raise BrokerError(
+            "peer_authentication_failed",
+            f"broker socket uid {socket_info.st_uid} does not match configured uid "
+            f"{expected_peer_uid}",
+        )
     if socket_info.st_uid != directory_info.st_uid:
         raise BrokerError(
             "peer_authentication_failed",
@@ -256,7 +273,9 @@ def _validated_client_socket(sock_path: str):
     return socket_info
 
 
-def _authenticate_broker_peer(conn, sock_path: str, socket_info) -> None:
+def _authenticate_broker_peer(
+    conn, sock_path: str, socket_info, expected_peer_uid: int
+) -> None:
     """Bind the connected Linux peer to the pre-connect filesystem identity."""
     try:
         current = os.lstat(sock_path)
@@ -271,10 +290,11 @@ def _authenticate_broker_peer(conn, sock_path: str, socket_info) -> None:
         raise BrokerError(
             "peer_authentication_failed", "broker socket changed while connecting"
         )
-    if peer_uid != socket_info.st_uid:
+    if peer_uid != expected_peer_uid:
         raise BrokerError(
             "peer_authentication_failed",
-            f"broker peer uid {peer_uid} does not own the configured socket",
+            f"broker peer uid {peer_uid} does not match configured uid "
+            f"{expected_peer_uid}",
         )
 
 
@@ -836,7 +856,8 @@ def _serve_connection(
             _reply(conn, {"ok": False, "error": exc.code, "message": exc.message})
             return
         except OSError as exc:
-            _reply(conn, {"ok": False, "error": "launch_failed", "message": str(exc)})
+            error = "request_too_large" if exc.errno == errno.E2BIG else "launch_failed"
+            _reply(conn, {"ok": False, "error": error, "message": str(exc)})
             return
         finally:
             # Every forwarded descriptor is the peer's channel, not ours: the child holds its

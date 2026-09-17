@@ -243,7 +243,7 @@ def test_local_environment_opt_in_executes_through_broker(tmp_path, monkeypatch)
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n    uid: {os.geteuid()}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -288,7 +288,7 @@ def test_process_registry_background_survives_foreground_broker_lease(
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n    uid: {os.geteuid()}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -327,7 +327,7 @@ def test_local_environment_broker_accepts_kernel_sized_command_payload(
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n    uid: {os.geteuid()}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -341,6 +341,71 @@ def test_local_environment_broker_accepts_kernel_sized_command_payload(
         if env is not None:
             env.cleanup()
         _stop_broker(proc)
+
+
+@pytest.mark.linux_only
+def test_local_environment_reports_execve_oversize_as_payload_error(
+    tmp_path, monkeypatch
+):
+    """An E2BIG request is a payload refusal; it does not poison the broker."""
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.environments.local import LocalEnvironment
+
+    root = _staging_root(tmp_path)
+    proc, sock_path = _start_broker(
+        "broker-only-secret", root, allowed_uids=[os.getuid()]
+    )
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n    uid: {os.geteuid()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    env = None
+    try:
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        with pytest.raises(EnvironmentConnectionError) as excinfo:
+            env.execute(": #" + "x" * 4_000_000)
+
+        assert "request is too large" in excinfo.value.reason
+        assert "broker is unavailable" not in excinfo.value.reason
+        assert "Reduce the command or environment payload" in excinfo.value.retry_hint
+
+        result = env.execute("printf ok")
+        assert result["returncode"] == 0
+        assert result["output"] == "ok"
+    finally:
+        if env is not None:
+            env.cleanup()
+        _stop_broker(proc)
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("expected_peer_uid", (None, -1, True, "1000"))
+def test_request_launch_rejects_invalid_expected_peer_uid_before_socket(
+    monkeypatch, expected_peer_uid
+):
+    """Direct callers cannot weaken the configured broker identity type."""
+    broker = _load_broker()
+
+    def fail_socket(*_args):
+        pytest.fail("invalid broker uid must be rejected before opening a socket")
+
+    monkeypatch.setattr(broker.socket, "socket", fail_socket)
+
+    with pytest.raises(broker.BrokerError) as excinfo:
+        broker.request_launch(
+            "test-only",
+            expected_peer_uid=expected_peer_uid,
+            argv=["/bin/true"],
+            cwd="/",
+            env={},
+            fds=[],
+        )
+
+    assert excinfo.value.code == "peer_authentication_failed"
 
 
 @pytest.mark.linux_only
@@ -371,7 +436,12 @@ def test_request_launch_rejects_oversized_frame_before_sending_payload(monkeypat
 
     with pytest.raises(broker.BrokerError) as excinfo:
         broker.request_launch(
-            "test-only", argv=["/bin/bash", "-c", "x" * 64], cwd="/", env={}, fds=[]
+            "test-only",
+            expected_peer_uid=os.geteuid(),
+            argv=["/bin/bash", "-c", "x" * 64],
+            cwd="/",
+            env={},
+            fds=[],
         )
 
     assert excinfo.value.code == "request_too_large"
@@ -429,6 +499,71 @@ def test_request_launch_authenticates_peer_before_sending_payload(
     with pytest.raises(broker.BrokerError) as excinfo:
         broker.request_launch(
             sock_path,
+            expected_peer_uid=os.geteuid(),
+            argv=["/bin/true"],
+            cwd="/",
+            env={"APPROVED_SECRET": "must-not-cross"},
+            fds=[],
+        )
+
+    assert excinfo.value.code == "peer_authentication_failed"
+    assert conn.closed
+
+
+@pytest.mark.linux_only
+def test_request_launch_refuses_unexpected_socket_owner_before_sending_payload(
+    tmp_path, monkeypatch
+):
+    """Configured broker identity must be checked before env or stdin crosses."""
+    broker = _load_broker()
+    socket_dir = tmp_path / "broker"
+    socket_dir.mkdir(mode=0o700)
+    sock_path = str(socket_dir / "broker.sock")
+    real_lstat = os.lstat
+    socket_info = os.stat_result((
+        stat.S_IFSOCK | 0o600,
+        4242,
+        1,
+        1,
+        os.geteuid(),
+        os.getegid(),
+        0,
+        0,
+        0,
+        0,
+    ))
+
+    def fake_lstat(path):
+        return socket_info if os.fspath(path) == sock_path else real_lstat(path)
+
+    class UnexpectedOwnerConnection:
+        closed = False
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _path):
+            pass
+
+        def getsockopt(self, _level, _kind, _size):
+            return broker._UCRED.pack(os.getpid(), os.geteuid(), os.getegid())
+
+        def sendmsg(self, _buffers, _ancillary):
+            pytest.fail(
+                "unexpected broker identity must be rejected before transmission"
+            )
+
+        def close(self):
+            self.closed = True
+
+    conn = UnexpectedOwnerConnection()
+    monkeypatch.setattr(broker.os, "lstat", fake_lstat)
+    monkeypatch.setattr(broker.socket, "socket", lambda *_args: conn)
+
+    with pytest.raises(broker.BrokerError) as excinfo:
+        broker.request_launch(
+            sock_path,
+            expected_peer_uid=os.geteuid() + 1,
             argv=["/bin/true"],
             cwd="/",
             env={"APPROVED_SECRET": "must-not-cross"},
@@ -456,7 +591,7 @@ def test_local_environment_broker_sweeps_descendants_after_shell_exit(
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n    uid: {os.geteuid()}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -501,7 +636,7 @@ def test_local_environment_reports_midflight_broker_death(tmp_path, monkeypatch)
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     (hermes_home / "config.yaml").write_text(
-        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n    uid: {os.geteuid()}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -548,6 +683,7 @@ def test_local_environment_closes_lease_when_broker_reply_is_malformed(
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     env = LocalEnvironment(cwd=str(tmp_path), timeout=1)
     env._local_exec_broker_socket = "test-only"
+    env._local_exec_broker_uid = os.geteuid()
     client, peer = socket.socketpair()
     baseline = _fd_count(os.getpid())
 
@@ -573,7 +709,7 @@ def test_local_environment_closes_lease_when_broker_reply_is_malformed(
 @pytest.mark.linux_only
 @pytest.mark.parametrize(
     "broker_yaml",
-    ("{}", "false", "{socket: ''}"),
+    ("{}", "false", "{socket: ''}", "{uid: 0}"),
 )
 def test_present_invalid_local_exec_broker_config_fails_closed(
     tmp_path, monkeypatch, broker_yaml
@@ -598,6 +734,33 @@ def test_present_invalid_local_exec_broker_config_fails_closed(
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize("broker_uid", ("null", "-1", "true", "'1000'"))
+def test_local_exec_broker_config_requires_non_negative_integer_uid(
+    tmp_path, monkeypatch, broker_uid
+):
+    """Missing, negative, bool, and string UIDs cannot weaken broker identity."""
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.environments.local import LocalEnvironment
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "terminal:\n"
+        "  local_exec_broker:\n"
+        "    socket: /run/hermes-broker/broker.sock\n"
+        f"    uid: {broker_uid}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(
+        EnvironmentConnectionError,
+        match="terminal.local_exec_broker requires a non-negative integer uid",
+    ):
+        LocalEnvironment(cwd=str(tmp_path), timeout=1)
+
+
+@pytest.mark.linux_only
 def test_local_environment_configured_broker_failure_never_falls_back(
     tmp_path, monkeypatch
 ):
@@ -609,7 +772,7 @@ def test_local_environment_configured_broker_failure_never_falls_back(
     hermes_home.mkdir()
     missing_socket = _socket_path()
     (hermes_home / "config.yaml").write_text(
-        f"terminal:\n  local_exec_broker:\n    socket: {missing_socket}\n",
+        f"terminal:\n  local_exec_broker:\n    socket: {missing_socket}\n    uid: {os.geteuid()}\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -655,13 +818,22 @@ def test_request_launch_preserves_coalesced_exit_frame(monkeypatch):
 
     conn = CoalescedConnection()
     monkeypatch.setattr(broker.socket, "socket", lambda *_args: conn)
-    monkeypatch.setattr(broker, "_validated_client_socket", lambda _path: object())
     monkeypatch.setattr(
-        broker, "_authenticate_broker_peer", lambda _conn, _path, _info: None
+        broker, "_validated_client_socket", lambda _path, _uid: object()
+    )
+    monkeypatch.setattr(
+        broker,
+        "_authenticate_broker_peer",
+        lambda _conn, _path, _info, _uid: None,
     )
 
     returned_conn, reply, remainder = broker.request_launch(
-        "test-only", argv=["true"], cwd="/", env={}, fds=[]
+        "test-only",
+        expected_peer_uid=os.geteuid(),
+        argv=["true"],
+        cwd="/",
+        env={},
+        fds=[],
     )
 
     assert returned_conn is conn
@@ -816,6 +988,7 @@ def test_runner_fd_launch_routes_explicit_stdout_descriptor(tmp_path):
     try:
         conn, reply, _remainder = broker.request_launch(
             sock_path,
+            expected_peer_uid=os.geteuid(),
             runner_fd=runner_fd,
             env={},
             fds=[],
@@ -875,6 +1048,7 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
         with pytest.raises(broker.BrokerError) as excinfo:
             broker.request_launch(
                 allowed_socket,
+                expected_peer_uid=os.geteuid(),
                 runner_fd=writable_runner_fd,
                 env={},
                 fds=[],
@@ -882,6 +1056,7 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
         assert excinfo.value.code == "runner_not_readable"
         conn, reply, _remainder = broker.request_launch(
             allowed_socket,
+            expected_peer_uid=os.geteuid(),
             runner_fd=runner_fd,
             env={},
             fds=[write_fd],
@@ -903,6 +1078,7 @@ def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
         with pytest.raises(broker.BrokerError) as excinfo:
             broker.request_launch(
                 denied_socket,
+                expected_peer_uid=os.geteuid(),
                 runner_fd=runner_fd,
                 env={},
                 fds=[],
@@ -1200,7 +1376,11 @@ def test_broker_launches_from_long_socket_directory(tmp_path):
         proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
         broker = _load_broker()
         conn, reply, _remainder = broker.request_launch(
-            sock_path, runner=str(runner), env={}, fds=[]
+            sock_path,
+            expected_peer_uid=os.geteuid(),
+            runner=str(runner),
+            env={},
+            fds=[],
         )
         assert reply["ok"] is True
     finally:
@@ -1227,7 +1407,11 @@ def test_broker_launches_when_socket_basename_is_publication_suffix(tmp_path):
         proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
         broker = _load_broker()
         conn, reply, _remainder = broker.request_launch(
-            sock_path, runner=str(runner), env={}, fds=[]
+            sock_path,
+            expected_peer_uid=os.geteuid(),
+            runner=str(runner),
+            env={},
+            fds=[],
         )
         assert reply["ok"] is True
     finally:
@@ -1258,7 +1442,11 @@ def test_broker_publishes_107_byte_socket_with_one_character_basename(tmp_path):
         proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
         broker = _load_broker()
         conn, reply, _remainder = broker.request_launch(
-            sock_path, runner=str(runner), env={}, fds=[]
+            sock_path,
+            expected_peer_uid=os.geteuid(),
+            runner=str(runner),
+            env={},
+            fds=[],
         )
         assert reply["ok"] is True
     finally:
@@ -1357,7 +1545,11 @@ def test_publication_slots_reclaim_only_stale_broker_sockets(tmp_path, request):
     try:
         proc, _ = _start_broker("host-only-secret", root, sock_path=sock_path)
         conn, reply, _remainder = broker.request_launch(
-            sock_path, runner=str(runner), env={}, fds=[]
+            sock_path,
+            expected_peer_uid=os.geteuid(),
+            runner=str(runner),
+            env={},
+            fds=[],
         )
         assert reply["ok"] is True
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1469,7 +1661,11 @@ def test_transient_accept_failure_preserves_live_lease(
     child_pid = None
     try:
         conn, reply, _remainder = broker.request_launch(
-            sock_path, runner=str(runner), env={}, fds=[]
+            sock_path,
+            expected_peer_uid=os.geteuid(),
+            runner=str(runner),
+            env={},
+            fds=[],
         )
         child_pid = reply["pid"]
         assert _pid_running(child_pid)
@@ -1649,6 +1845,7 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
         try:
             conn, reply, _remainder = broker.request_launch(
                 sock_path,
+                expected_peer_uid=os.geteuid(),
                 runner=str(runner),
                 env={"BROKER_PROBE_APPROVED": "approved-value-42"},
                 fds=[write_fd],
@@ -1858,7 +2055,11 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
         read_fd, write_fd = os.pipe()
         try:
             conn, reply, _remainder = broker.request_launch(
-                sock_path, runner=str(runner), env={}, fds=[write_fd]
+                sock_path,
+                expected_peer_uid=os.geteuid(),
+                runner=str(runner),
+                env={},
+                fds=[write_fd],
             )
             os.close(write_fd)
             write_fd = -1
@@ -1874,7 +2075,13 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
         # A refused request must also be a typed failure on the client, not a JSONDecodeError
         # escaping from inside the helper (which would also strand the client's own socket).
         with pytest.raises(broker.BrokerError) as excinfo:
-            broker.request_launch(sock_path, runner=str(outside), env={}, fds=[])
+            broker.request_launch(
+                sock_path,
+                expected_peer_uid=os.geteuid(),
+                runner=str(outside),
+                env={},
+                fds=[],
+            )
         assert excinfo.value.code == "runner_outside_root"
     finally:
         _stop_broker(proc)
@@ -1954,7 +2161,11 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
         read_fd, write_fd = os.pipe()
         try:
             conn, reply, _remainder = broker.request_launch(
-                sock_path, runner=str(group_runner), env={}, fds=[write_fd]
+                sock_path,
+                expected_peer_uid=os.geteuid(),
+                runner=str(group_runner),
+                env={},
+                fds=[write_fd],
             )
             os.close(write_fd)
             write_fd = -1
@@ -1984,7 +2195,11 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
         read_fd, write_fd = os.pipe()
         try:
             conn, reply, _remainder = broker.request_launch(
-                sock_path, runner=str(quick_runner), env={}, fds=[write_fd]
+                sock_path,
+                expected_peer_uid=os.geteuid(),
+                runner=str(quick_runner),
+                env={},
+                fds=[write_fd],
             )
             os.close(write_fd)
             write_fd = -1
@@ -2050,7 +2265,11 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
         term_reads = []
         try:
             held, reply, _remainder = broker.request_launch(
-                sock_path, runner=str(group_runner), env={}, fds=[write_fd]
+                sock_path,
+                expected_peer_uid=os.geteuid(),
+                runner=str(group_runner),
+                env={},
+                fds=[write_fd],
             )
             os.close(write_fd)
             write_fd = -1
@@ -2060,7 +2279,11 @@ def test_brokered_child_is_terminated_when_the_client_connection_disappears(
             for _ in range(2):
                 term_read, term_write = os.pipe()
                 term_conn, term_reply, _remainder = broker.request_launch(
-                    sock_path, runner=str(term_runner), env={}, fds=[term_write]
+                    sock_path,
+                    expected_peer_uid=os.geteuid(),
+                    runner=str(term_runner),
+                    env={},
+                    fds=[term_write],
                 )
                 os.close(term_write)
                 assert _read_with_deadline(term_read, until_eof=False) == b"ready"
