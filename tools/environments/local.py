@@ -44,6 +44,7 @@ class _BrokerProcessHandle:
         self._conn = conn
         self.pid = pid
         self._returncode = None
+        self._failure = None
         self._reply = b""
         self._poll_lock = threading.Lock()
         self.stdout = os.fdopen(stdout_fd, "r", encoding="utf-8", errors="replace")
@@ -60,6 +61,8 @@ class _BrokerProcessHandle:
 
     def poll(self):
         with self._poll_lock:
+            if self._failure is not None:
+                raise self._failure
             if self._returncode is not None:
                 return self._returncode
             try:
@@ -76,7 +79,14 @@ class _BrokerProcessHandle:
                 self._returncode = int(reply["exit"])
                 self._conn.close()
             else:
-                self._returncode = -1
+                self._conn.close()
+                self._failure = EnvironmentConnectionError(
+                    "configured local execution broker failed during command execution",
+                    retry_hint=(
+                        "Restart the operator-owned broker service and retry the command."
+                    ),
+                )
+                raise self._failure
             return self._returncode
 
     def wait(self, timeout=None):
@@ -88,12 +98,13 @@ class _BrokerProcessHandle:
         return self._returncode
 
     def kill(self):
-        if self._returncode is not None:
-            return
-        with contextlib.suppress(OSError):
-            self._conn.shutdown(socket.SHUT_RDWR)
-        self._conn.close()
-        self._returncode = -signal.SIGKILL
+        with self._poll_lock:
+            if self._returncode is not None:
+                return
+            self._returncode = -signal.SIGKILL
+            with contextlib.suppress(OSError):
+                self._conn.shutdown(socket.SHUT_RDWR)
+            self._conn.close()
 
 
 # --- Terminal temp-cache pruning ---

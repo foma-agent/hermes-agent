@@ -341,6 +341,7 @@ def _validated(request):
             "bad_request",
             "request must carry exactly one of 'runner', 'runner_fd', or 'argv'",
         )
+    cwd = None
     if argv is not None:
         if (
             not isinstance(argv, list)
@@ -357,6 +358,14 @@ def _validated(request):
             raise BrokerError(
                 "bad_request", "argv launches require a non-empty 'cwd' without NUL"
             )
+        try:
+            os.fsencode(cwd)
+        except UnicodeEncodeError as exc:
+            raise BrokerError(
+                "bad_request", "argv launch 'cwd' is not filesystem-encodable"
+            ) from exc
+    elif "cwd" in request:
+        raise BrokerError("bad_request", "'cwd' is valid only for argv launches")
     elif not uses_runner_fd:
         if not isinstance(runner, str) or not runner:
             raise BrokerError("bad_request", "'runner' must be a non-empty string")
@@ -398,7 +407,7 @@ def _validated(request):
         if not isinstance(index, int) or isinstance(index, bool) or index < 0:
             raise BrokerError("bad_request", f"'{name}' must be a descriptor index")
         stdio[name] = index
-    return runner, uses_runner_fd, argv, request.get("cwd"), env, stdio
+    return runner, uses_runner_fd, argv, cwd, env, stdio
 
 
 def _resolve_runner(staging_root: str, runner: str) -> str:
@@ -439,7 +448,13 @@ def _validate_runner_fd(fd: int) -> None:
 
 
 def _launch(
-    runner_fd: int | None, env: dict, fds: list, *, argv=None, cwd=None, stdio=None
+    runner_fd: int | None,
+    env: dict,
+    fds: list,
+    *,
+    argv=None,
+    cwd=None,
+    stdio_fds=None,
 ):
     """Spawn the child with everything handed over explicitly."""
     child_env = dict(env)
@@ -460,18 +475,9 @@ def _launch(
         ]
     else:
         child_argv = argv
-    stdio = stdio or {}
-    try:
-        child_stdin = (
-            fds[stdio["stdin_fd"]] if "stdin_fd" in stdio else subprocess.DEVNULL
-        )
-        child_stdout = (
-            fds[stdio["stdout_fd"]] if "stdout_fd" in stdio else subprocess.DEVNULL
-        )
-    except IndexError as exc:
-        raise BrokerError(
-            "bad_request", "stdio descriptor index was not received"
-        ) from exc
+    stdio_fds = stdio_fds or {}
+    child_stdin = stdio_fds.get("stdin_fd", subprocess.DEVNULL)
+    child_stdout = stdio_fds.get("stdout_fd", subprocess.DEVNULL)
     return subprocess.Popen(
         child_argv,
         env=child_env,
@@ -524,6 +530,19 @@ def _exited_unreaped(pid: int) -> bool:
         )
     except ChildProcessError:
         return True
+
+
+def _unreaped_returncode(pid: int) -> int | None:
+    """Read a child's exit status without releasing its pid for the final group sweep."""
+    try:
+        info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        return None
+    if info is None:
+        return None
+    if info.si_code == os.CLD_EXITED:
+        return info.si_status
+    return -info.si_status
 
 
 def _terminate(proc) -> None:
@@ -682,6 +701,7 @@ def _serve_connection(
     proc, runner_fd = None, None
     # Descriptors the kernel installed on our behalf. One owner, one close, every path out.
     fds: list = []
+    stdio_fds: dict[str, int] = {}
     try:
         try:
             if allowed_uids is None:
@@ -697,6 +717,18 @@ def _serve_connection(
             runner, uses_runner_fd, argv, cwd, env, stdio = _recv_request(
                 conn, fds, handshake_timeout
             )
+            indexes = list(stdio.values())
+            if (
+                len(set(indexes)) != len(indexes)
+                or any(index >= len(fds) for index in indexes)
+                or (uses_runner_fd and 0 in indexes)
+            ):
+                raise BrokerError(
+                    "bad_request", "stdio descriptor index was not received"
+                )
+            stdio_fds = {name: fds[index] for name, index in stdio.items()}
+            for index in sorted(indexes, reverse=True):
+                fds.pop(index)
             if uses_runner_fd:
                 if not fds:
                     raise BrokerError(
@@ -716,7 +748,7 @@ def _serve_connection(
                     "too_many_fds",
                     f"at most {MAX_FDS} descriptors may be passed per request",
                 )
-            proc = _launch(runner_fd, env, fds, argv=argv, cwd=cwd, stdio=stdio)
+            proc = _launch(runner_fd, env, fds, argv=argv, cwd=cwd, stdio_fds=stdio_fds)
         except BrokerError as exc:
             _reply(conn, {"ok": False, "error": exc.code, "message": exc.message})
             return
@@ -727,6 +759,7 @@ def _serve_connection(
             # Every forwarded descriptor is the peer's channel, not ours: the child holds its
             # own copies, and a retained copy here would keep a pipe from ever reaching EOF.
             _close_all(fds)
+            _close_all(list(stdio_fds.values()))
             if runner_fd is not None:
                 os.close(runner_fd)
         # Registered BEFORE the reply: a SIGTERM racing the handshake must still find this
@@ -742,9 +775,11 @@ def _serve_connection(
         with contextlib.suppress(OSError):
             _await_lease_end(conn, proc)
         # Legacy runner clients use EOF as their completion signal. Only argv clients opt in
-        # to the status frame required by the ProcessHandle contract.
-        if argv is not None and proc.poll() is not None:
-            _reply(conn, {"exit": proc.returncode})
+        # to the status frame required by the ProcessHandle contract. Observe without reaping:
+        # the finalizer still needs the leader pid pinned while it sweeps the whole group.
+        returncode = _unreaped_returncode(proc.pid) if argv is not None else None
+        if returncode is not None:
+            _reply(conn, {"exit": returncode})
     finally:
         with contextlib.suppress(OSError):
             conn.close()

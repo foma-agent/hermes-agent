@@ -33,6 +33,7 @@ import importlib.util
 import json
 import os
 import selectors
+import shlex
 import shutil
 import signal
 import socket
@@ -253,21 +254,117 @@ def test_local_environment_opt_in_executes_through_broker(tmp_path, monkeypatch)
     try:
         env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
         result = env.execute(
-            "read value; printf 'out:%s uid:%s ppid:%s cwd:%s env:%s secret:%s\\n' "
+            "read value; printf 'out:%s uid:%s ppid:%s cwd:%s env:%s secret:%s fds:%s\\n' "
             '"$value" "$(id -u)" "$PPID" "$PWD" "$LOCAL_EXEC_VISIBLE" '
-            '"${OPENAI_API_KEY-unset}"; printf "err\\n" >&2; exit 7',
+            '"${OPENAI_API_KEY-unset}" "${HERMES_BROKER_FDS:-empty}"; '
+            'printf "err\\n" >&2; exit 7',
             stdin_data="input payload\n",
         )
 
         assert result["returncode"] == 7
         assert (
             f"out:input payload uid:{os.getuid()} ppid:{proc.pid} cwd:{tmp_path} "
-            "env:approved secret:unset\nerr\n"
+            "env:approved secret:unset fds:empty\nerr\n"
         ) in result["output"]
     finally:
         if env is not None:
             env.cleanup()
         _stop_broker(proc)
+
+
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+def test_local_environment_broker_sweeps_descendants_after_shell_exit(
+    tmp_path, monkeypatch
+):
+    """A completed shell must not let a background descendant outlive its broker lease."""
+    from tools.environments.local import LocalEnvironment
+
+    root = _staging_root(tmp_path)
+    proc, sock_path = _start_broker(
+        "broker-only-secret",
+        root,
+        allowed_uids=[os.getuid()],
+    )
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    env = None
+    child_pid = None
+    try:
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        result = env.execute(
+            "sleep 300 </dev/null >/dev/null 2>&1 & printf '__child__%s\\n' \"$!\""
+        )
+        child_pid = int(
+            next(
+                line.removeprefix("__child__")
+                for line in result["output"].splitlines()
+                if line.startswith("__child__")
+            )
+        )
+
+        assert result["returncode"] == 0
+        assert _wait_until_gone(child_pid)
+    finally:
+        if env is not None:
+            env.cleanup()
+        if child_pid is not None and _pid_running(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+        _stop_broker(proc)
+
+
+@pytest.mark.linux_only
+def test_local_environment_reports_midflight_broker_death(tmp_path, monkeypatch):
+    """Lease EOF without an exit frame is a broker failure, not command return code -1."""
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.environments.local import LocalEnvironment
+
+    root = _staging_root(tmp_path)
+    proc, sock_path = _start_broker(
+        "broker-only-secret",
+        root,
+        allowed_uids=[os.getuid()],
+    )
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    marker = tmp_path / "child-started"
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+
+    def kill_broker_after_launch():
+        deadline = time.monotonic() + DEADLINE
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert marker.exists()
+        proc.kill()
+
+    killer = threading.Thread(target=kill_broker_after_launch)
+    killer.start()
+    try:
+        with pytest.raises(
+            EnvironmentConnectionError,
+            match="configured local execution broker failed during command execution",
+        ):
+            env.execute(
+                f"touch {shlex.quote(str(marker))}; "
+                'while kill -0 "$PPID" 2>/dev/null; do sleep 0.05; done'
+            )
+    finally:
+        killer.join(timeout=DEADLINE)
+        env.cleanup()
+        _stop_broker(proc)
+    assert not killer.is_alive()
 
 
 @pytest.mark.linux_only
@@ -352,6 +449,41 @@ def test_broker_process_poll_does_not_overwrite_exit_status_during_concurrent_po
     assert not any(thread.is_alive() for thread in threads)
     assert handle.returncode == 7
     assert 7 in results
+
+
+@pytest.mark.linux_only
+def test_runner_fd_launch_routes_explicit_stdout_descriptor(tmp_path):
+    """stdio indices remain valid when the runner descriptor occupies wire slot zero."""
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    runner = _stage_runner(
+        root, "stdout_runner.py", "print('runner-stdout', flush=True)\n"
+    )
+    proc, sock_path = _start_broker("broker-only-secret", root)
+    runner_fd = os.open(runner, os.O_RDONLY | os.O_CLOEXEC)
+    read_fd, write_fd = os.pipe()
+    conn = None
+    try:
+        conn, reply = broker.request_launch(
+            sock_path,
+            runner_fd=runner_fd,
+            env={},
+            fds=[],
+            stdout_fd=write_fd,
+        )
+        assert reply["ok"] is True
+        os.close(write_fd)
+        write_fd = -1
+        assert _read_with_deadline(read_fd, until_eof=True) == b"runner-stdout\n"
+    finally:
+        if conn is not None:
+            conn.close()
+        os.close(runner_fd)
+        os.close(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+        _stop_broker(proc)
+        assert "Traceback" not in proc.stderr.read()
 
 
 @pytest.mark.linux_only
@@ -1112,6 +1244,18 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
             (
                 "body that is not a launch request",
                 b'{"op": "nope"}\n',
+                1,
+                "bad_request",
+            ),
+            (
+                "legacy runner request carrying cwd",
+                json.dumps({
+                    "op": "launch",
+                    "runner": str(runner),
+                    "cwd": 5,
+                    "env": {},
+                }).encode()
+                + b"\n",
                 1,
                 "bad_request",
             ),
