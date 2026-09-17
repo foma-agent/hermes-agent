@@ -229,6 +229,132 @@ def _staging_root(tmp_path):
 
 
 @pytest.mark.linux_only
+def test_local_environment_opt_in_executes_through_broker(tmp_path, monkeypatch):
+    """The configured local terminal path is a real broker lease, not a fallback."""
+    from tools.environments.local import LocalEnvironment
+
+    root = _staging_root(tmp_path)
+    proc, sock_path = _start_broker(
+        "broker-only-secret",
+        root,
+        allowed_uids=[os.getuid()],
+    )
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  local_exec_broker:\n    socket: {sock_path}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("LOCAL_EXEC_VISIBLE", "approved")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-be-scrubbed")
+
+    env = None
+    try:
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+        result = env.execute(
+            "read value; printf 'out:%s uid:%s ppid:%s cwd:%s env:%s secret:%s\\n' "
+            '"$value" "$(id -u)" "$PPID" "$PWD" "$LOCAL_EXEC_VISIBLE" '
+            '"${OPENAI_API_KEY-unset}"; printf "err\\n" >&2; exit 7',
+            stdin_data="input payload\n",
+        )
+
+        assert result["returncode"] == 7
+        assert (
+            f"out:input payload uid:{os.getuid()} ppid:{proc.pid} cwd:{tmp_path} "
+            "env:approved secret:unset\nerr\n"
+        ) in result["output"]
+    finally:
+        if env is not None:
+            env.cleanup()
+        _stop_broker(proc)
+
+
+@pytest.mark.linux_only
+def test_local_environment_configured_broker_failure_never_falls_back(
+    tmp_path, monkeypatch
+):
+    """A configured broker is a required boundary, not a best-effort launch path."""
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.environments.local import LocalEnvironment
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    missing_socket = _socket_path()
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  local_exec_broker:\n    socket: {missing_socket}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=1)
+    try:
+        with pytest.raises(
+            EnvironmentConnectionError,
+            match="configured local execution broker is unavailable",
+        ):
+            env.execute("printf should-not-run")
+    finally:
+        env.cleanup()
+        shutil.rmtree(Path(missing_socket).parent)
+
+
+@pytest.mark.linux_only
+def test_broker_process_poll_does_not_overwrite_exit_status_during_concurrent_poll():
+    """The wait loop and stdout drainer may poll together; EOF cannot erase the exit frame."""
+    from tools.environments.local import _BrokerProcessHandle
+
+    class RacingConnection:
+        def __init__(self):
+            self._calls = 0
+            self._lock = threading.Lock()
+            self._first_receiving = threading.Event()
+            self._second_poll_started = threading.Event()
+            self._frame_consumed = threading.Event()
+
+        def setblocking(self, _blocking):
+            pass
+
+        def recv(self, _size):
+            with self._lock:
+                call = self._calls
+                self._calls += 1
+            if call == 0:
+                self._first_receiving.set()
+                assert self._second_poll_started.wait(timeout=DEADLINE)
+                return b'{"exit": 7}\n'
+            assert self._frame_consumed.wait(timeout=DEADLINE)
+            return b""
+
+        def close(self):
+            self._frame_consumed.set()
+
+    conn = RacingConnection()
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    handle = _BrokerProcessHandle(conn, 123, read_fd, None)
+    results = []
+    first = threading.Thread(target=lambda: results.append(handle.poll()))
+
+    def second_poll():
+        conn._second_poll_started.set()
+        results.append(handle.poll())
+
+    second = threading.Thread(target=second_poll)
+    first.start()
+    assert conn._first_receiving.wait(timeout=DEADLINE)
+    second.start()
+    threads = [first, second]
+    for thread in threads:
+        thread.join(timeout=DEADLINE)
+
+    handle.stdout.close()
+    assert not any(thread.is_alive() for thread in threads)
+    assert handle.returncode == 7
+    assert 7 in results
+
+
+@pytest.mark.linux_only
 def test_runner_fd_launch_requires_allowed_peer_uid(tmp_path):
     """Runner transport and peer authority are one boundary, enforced before launch."""
     broker = _load_broker()

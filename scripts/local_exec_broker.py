@@ -33,8 +33,9 @@ channel that survives a uid switch:
                 kills the child process group, the same signal shape as the inherited
                 parent-death pipe, but owned by the broker rather than inherited through sudo.
 
-Everything the child does not receive explicitly, it does not get: stdin, stdout AND stderr
-are all ``DEVNULL``, so no channel crosses the boundary by inheritance.
+Everything the child does not receive explicitly, it does not get. Legacy runner requests keep
+stdin, stdout and stderr on ``DEVNULL``. The local-terminal argv request carries explicit stdin
+and merged stdout/stderr descriptors, and nothing is inherited from the broker process.
 
 **The request frame is the only untrusted surface, so it is the one that is bounded.** A
 request is one newline-terminated JSON object of at most ``MAX_REQUEST_BYTES`` carrying at
@@ -60,17 +61,20 @@ more privileged account. This direct prototype owns and cleans up only the proce
 creates. Adversarial descendants can escape by creating another session; containing those
 requires the planned systemd/cgroup scope at integration.
 
-Future integration seam (deliberately NOT wired yet, so nothing dead lands in core):
+Integration seams:
 
-  * ``tools/code_kernel.py:_spawn`` becomes a ``request_launch`` call — ``child_env`` is the
-    ``env`` payload, ``death_r`` and the runner staging dir are what this already transports,
-    and the returned connection replaces ``kernel.death_pipe_w`` as the liveness handle held
-    by ``SessionKernel``.
-  * ``tools/environments/local.py:_run_bash`` follows with argv + cwd added to the request.
+  * ``tools/environments/local.py:_run_bash`` now opts in when
+    ``terminal.local_exec_broker.socket`` is configured. Its argv, cwd, scrubbed environment,
+    stdin, and merged stdout/stderr cross explicitly; broker failure is fatal rather than a
+    same-uid fallback.
+  * ``tools/code_kernel.py:_spawn`` remains future work: it becomes a ``request_launch`` call —
+    ``child_env`` is the ``env`` payload, ``death_r`` and the runner staging dir are what this
+    already transports, and the returned connection replaces ``kernel.death_pipe_w`` as the
+    liveness handle held by ``SessionKernel``.
   * ``tools/process_registry.py``'s systemd-scope isolation composes on the broker side,
     where the trusted uid still has a user bus.
 
-Until those land this file is a prototype with its own behaviour test
+This remains a Linux prototype with its own behaviour test
 (``tests/scripts/test_local_exec_broker.py``), not production surface.
 """
 
@@ -156,8 +160,12 @@ def request_launch(
     *,
     runner: str | None = None,
     runner_fd: int | None = None,
+    argv: list[str] | None = None,
+    cwd: str | None = None,
     env: dict,
     fds: list,
+    stdin_fd: int | None = None,
+    stdout_fd: int | None = None,
     timeout: float = 30.0,
 ):
     """Client side: ask the broker to launch *runner*; return ``(connection, reply)``.
@@ -171,15 +179,27 @@ def request_launch(
     try:
         conn.settimeout(timeout)
         conn.connect(sock_path)
-        if (runner is None) == (runner_fd is None):
-            raise ValueError("exactly one of runner or runner_fd is required")
+        launch_kinds = sum((
+            runner is not None,
+            runner_fd is not None,
+            argv is not None,
+        ))
+        if launch_kinds != 1:
+            raise ValueError("exactly one of runner, runner_fd, or argv is required")
         request = {"op": "launch", "env": env}
         rights = list(fds)
         if runner_fd is not None:
             request["runner_fd"] = True
             rights.insert(0, runner_fd)
+        elif argv is not None:
+            request["argv"] = argv
+            request["cwd"] = cwd
         else:
             request["runner"] = runner
+        for name, fd in (("stdin_fd", stdin_fd), ("stdout_fd", stdout_fd)):
+            if fd is not None:
+                request[name] = len(rights)
+                rights.append(fd)
         body = json.dumps(request).encode("utf-8") + b"\n"
         _sendmsg_all(conn, body, _ancillary(rights))
         reply = _read_reply(conn)
@@ -314,12 +334,30 @@ def _validated(request):
     if request.get("op") != "launch":
         raise BrokerError("bad_request", f"unsupported op {request.get('op')!r}")
     runner = request.get("runner")
+    argv = request.get("argv")
     uses_runner_fd = request.get("runner_fd") is True
-    if uses_runner_fd == (runner is not None):
+    if sum((uses_runner_fd, runner is not None, argv is not None)) != 1:
         raise BrokerError(
-            "bad_request", "request must carry exactly one of 'runner' or 'runner_fd'"
+            "bad_request",
+            "request must carry exactly one of 'runner', 'runner_fd', or 'argv'",
         )
-    if not uses_runner_fd:
+    if argv is not None:
+        if (
+            not isinstance(argv, list)
+            or not argv
+            or not all(
+                isinstance(part, str) and part and "\0" not in part for part in argv
+            )
+        ):
+            raise BrokerError(
+                "bad_request", "'argv' must be a non-empty string array without NUL"
+            )
+        cwd = request.get("cwd")
+        if not isinstance(cwd, str) or not cwd or "\0" in cwd:
+            raise BrokerError(
+                "bad_request", "argv launches require a non-empty 'cwd' without NUL"
+            )
+    elif not uses_runner_fd:
         if not isinstance(runner, str) or not runner:
             raise BrokerError("bad_request", "'runner' must be a non-empty string")
         if "\0" in runner:
@@ -352,7 +390,15 @@ def _validated(request):
         raise BrokerError(
             "bad_request", "environment entries must be OS-encodable"
         ) from exc
-    return runner, uses_runner_fd, env
+    stdio = {}
+    for name in ("stdin_fd", "stdout_fd"):
+        if name not in request:
+            continue
+        index = request[name]
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+            raise BrokerError("bad_request", f"'{name}' must be a descriptor index")
+        stdio[name] = index
+    return runner, uses_runner_fd, argv, request.get("cwd"), env, stdio
 
 
 def _resolve_runner(staging_root: str, runner: str) -> str:
@@ -392,7 +438,9 @@ def _validate_runner_fd(fd: int) -> None:
         raise BrokerError("runner_not_readable", "runner descriptor must be read-only")
 
 
-def _launch(runner_fd: int, env: dict, fds: list):
+def _launch(
+    runner_fd: int | None, env: dict, fds: list, *, argv=None, cwd=None, stdio=None
+):
     """Spawn the child with everything handed over explicitly."""
     child_env = dict(env)
     child_env[FDS_ENV] = ",".join(str(fd) for fd in fds)
@@ -401,19 +449,42 @@ def _launch(runner_fd: int, env: dict, fds: list):
     # The bootstrap reads the already-open descriptor directly. Asking the interpreter to open
     # ``/proc/self/fd/N`` as a script would re-check the inode's mode bits and fail after a
     # legitimate cross-UID SCM_RIGHTS handoff, even though the descriptor itself is readable.
-    runner_path = f"/proc/self/fd/{runner_fd}"
+    if argv is None:
+        runner_path = f"/proc/self/fd/{runner_fd}"
+        child_argv = [
+            sys.executable,
+            "-c",
+            _RUNNER_BOOTSTRAP,
+            runner_path,
+            str(runner_fd),
+        ]
+    else:
+        child_argv = argv
+    stdio = stdio or {}
+    try:
+        child_stdin = (
+            fds[stdio["stdin_fd"]] if "stdin_fd" in stdio else subprocess.DEVNULL
+        )
+        child_stdout = (
+            fds[stdio["stdout_fd"]] if "stdout_fd" in stdio else subprocess.DEVNULL
+        )
+    except IndexError as exc:
+        raise BrokerError(
+            "bad_request", "stdio descriptor index was not received"
+        ) from exc
     return subprocess.Popen(
-        [sys.executable, "-c", _RUNNER_BOOTSTRAP, runner_path, str(runner_fd)],
+        child_argv,
         env=child_env,
-        pass_fds=(runner_fd, *fds),
+        pass_fds=tuple(fd for fd in (runner_fd, *fds) if fd is not None),
         close_fds=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
+        stdin=child_stdin,
+        stdout=child_stdout,
         # Explicit, like stdin and stdout. An inherited stderr is a channel the client never
         # asked for: a write handle into the trusted side's log stream, and an undrained pipe
         # the child can wedge itself on.
-        stderr=subprocess.DEVNULL,
+        stderr=child_stdout,
         start_new_session=True,
+        cwd=cwd,
     )
 
 
@@ -623,7 +694,9 @@ def _serve_connection(
                     "peer_uid_not_allowed",
                     f"peer uid {peer_uid} is not allowed",
                 )
-            runner, uses_runner_fd, env = _recv_request(conn, fds, handshake_timeout)
+            runner, uses_runner_fd, argv, cwd, env, stdio = _recv_request(
+                conn, fds, handshake_timeout
+            )
             if uses_runner_fd:
                 if not fds:
                     raise BrokerError(
@@ -631,14 +704,19 @@ def _serve_connection(
                     )
                 runner_fd = fds.pop(0)
                 _validate_runner_fd(runner_fd)
-            else:
+            elif runner is not None:
                 if len(fds) > MAX_FDS:
                     raise BrokerError(
                         "too_many_fds",
                         f"at most {MAX_FDS} descriptors may be passed per request",
                     )
                 runner_fd = _open_runner(_resolve_runner(staging_root, runner))
-            proc = _launch(runner_fd, env, fds)
+            if len(fds) > MAX_FDS:
+                raise BrokerError(
+                    "too_many_fds",
+                    f"at most {MAX_FDS} descriptors may be passed per request",
+                )
+            proc = _launch(runner_fd, env, fds, argv=argv, cwd=cwd, stdio=stdio)
         except BrokerError as exc:
             _reply(conn, {"ok": False, "error": exc.code, "message": exc.message})
             return
@@ -663,6 +741,10 @@ def _serve_connection(
         # parent-death pipe gave us before sudo started closing it.
         with contextlib.suppress(OSError):
             _await_lease_end(conn, proc)
+        # Legacy runner clients use EOF as their completion signal. Only argv clients opt in
+        # to the status frame required by the ProcessHandle contract.
+        if argv is not None and proc.poll() is not None:
+            _reply(conn, {"exit": proc.returncode})
     finally:
         with contextlib.suppress(OSError):
             conn.close()
