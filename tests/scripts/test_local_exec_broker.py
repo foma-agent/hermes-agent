@@ -368,6 +368,69 @@ def test_local_environment_reports_midflight_broker_death(tmp_path, monkeypatch)
 
 
 @pytest.mark.linux_only
+def test_local_environment_closes_lease_when_broker_reply_is_malformed(
+    tmp_path, monkeypatch
+):
+    """Handle-construction failure must close the lease and every locally owned descriptor."""
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.environments.local import LocalEnvironment
+    import scripts.local_exec_broker as broker
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=1)
+    env._local_exec_broker_socket = "test-only"
+    client, peer = socket.socketpair()
+    baseline = _fd_count(os.getpid())
+
+    def malformed_launch(*_args, **_kwargs):
+        return client, {"ok": True}
+
+    monkeypatch.setattr(broker, "request_launch", malformed_launch)
+    try:
+        with pytest.raises(
+            EnvironmentConnectionError,
+            match="returned an invalid launch reply",
+        ):
+            env._run_bash("true")
+        peer.settimeout(DEADLINE)
+        assert peer.recv(1) == b""
+        assert _fd_count(os.getpid()) == baseline - 1
+    finally:
+        env.cleanup()
+        client.close()
+        peer.close()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize(
+    "broker_yaml",
+    ("{}", "false", "{socket: ''}"),
+)
+def test_present_invalid_local_exec_broker_config_fails_closed(
+    tmp_path, monkeypatch, broker_yaml
+):
+    """Once the broker section exists, an invalid socket cannot opt back into direct Popen."""
+    from tools.environments.base import EnvironmentConnectionError
+    from tools.environments.local import LocalEnvironment
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        f"terminal:\n  local_exec_broker: {broker_yaml}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(
+        EnvironmentConnectionError,
+        match="terminal.local_exec_broker requires a non-empty string socket",
+    ):
+        LocalEnvironment(cwd=str(tmp_path), timeout=1)
+
+
+@pytest.mark.linux_only
 def test_local_environment_configured_broker_failure_never_falls_back(
     tmp_path, monkeypatch
 ):
@@ -633,6 +696,126 @@ def _sendmsg_all(conn, body: bytes, ancillary) -> None:
             raise ConnectionError("sendmsg made no progress")
         sent += written
         first = False
+
+
+@pytest.mark.linux_only
+def test_departed_peer_during_exit_frame_does_not_escape_connection_worker(
+    monkeypatch, tmp_path
+):
+    """A client departure precisely at exit-frame delivery is routine lease teardown."""
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+
+    class DepartingConnection:
+        def __init__(self):
+            self.replies = 0
+            self.closed = False
+
+        def getsockopt(self, *_args):
+            return broker._UCRED.pack(os.getpid(), os.geteuid(), os.getegid())
+
+        def sendall(self, _payload):
+            self.replies += 1
+            if self.replies == 2:
+                raise BrokenPipeError(errno.EPIPE, "peer departed before exit frame")
+
+        def close(self):
+            self.closed = True
+
+    class ExitedProcess:
+        pid = 123
+
+    conn = DepartingConnection()
+    exited = ExitedProcess()
+    leases = broker._Leases()
+    assert leases.register(conn, threading.current_thread())
+    terminated = []
+    monkeypatch.setattr(
+        broker,
+        "_recv_request",
+        lambda *_args: (None, False, ["/bin/true"], str(tmp_path), {}, {}),
+    )
+    monkeypatch.setattr(broker, "_launch", lambda *_args, **_kwargs: exited)
+    monkeypatch.setattr(broker, "_await_lease_end", lambda *_args: None)
+    monkeypatch.setattr(broker, "_unreaped_returncode", lambda _pid: 0)
+    monkeypatch.setattr(broker, "_terminate", terminated.append)
+
+    broker._serve_connection(conn, str(root), HANDSHAKE_TIMEOUT, leases)
+
+    assert conn.replies == 2
+    assert conn.closed is True
+    assert terminated == [exited]
+
+
+@pytest.mark.linux_only
+def test_stdio_index_guards_return_bad_request_without_leaking_fds(tmp_path):
+    """Malformed stdio indexes are refused before descriptor ownership can be corrupted."""
+    broker = _load_broker()
+    root = _staging_root(tmp_path)
+    requests = (
+        {
+            "op": "launch",
+            "argv": ["/bin/true"],
+            "cwd": str(tmp_path),
+            "env": {},
+            "stdin_fd": 0,
+            "stdout_fd": 0,
+        },
+        {
+            "op": "launch",
+            "argv": ["/bin/true"],
+            "cwd": str(tmp_path),
+            "env": {},
+            "stdout_fd": 1,
+        },
+        {
+            "op": "launch",
+            "runner_fd": True,
+            "env": {},
+            "stdin_fd": 0,
+        },
+    )
+    baseline = _fd_count(os.getpid())
+
+    for request in requests:
+        read_fd, write_fd = os.pipe()
+        replies = []
+
+        class Connection:
+            def getsockopt(self, *_args):
+                return broker._UCRED.pack(os.getpid(), os.geteuid(), os.getegid())
+
+            def sendall(self, payload):
+                replies.append(json.loads(payload))
+
+            def close(self):
+                pass
+
+        conn = Connection()
+        leases = broker._Leases()
+        assert leases.register(conn, threading.current_thread())
+        real_recv_request = broker._recv_request
+
+        def receive(_conn, fds, _timeout):
+            fds.append(os.dup(write_fd))
+            return broker._validated(request)
+
+        broker._recv_request = receive
+        try:
+            broker._serve_connection(conn, str(root), HANDSHAKE_TIMEOUT, leases)
+            reply = replies[0]
+            assert reply["ok"] is False
+            assert reply["error"] == "bad_request"
+            os.close(write_fd)
+            write_fd = -1
+            assert _read_with_deadline(read_fd, until_eof=True) == b""
+        finally:
+            broker._recv_request = real_recv_request
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+    assert _fd_count(os.getpid()) == baseline
 
 
 @pytest.mark.linux_only
@@ -1244,6 +1427,18 @@ def test_broker_transports_approved_resources_and_refuses_invalid_requests_witho
             (
                 "body that is not a launch request",
                 b'{"op": "nope"}\n',
+                1,
+                "bad_request",
+            ),
+            (
+                "argv launch carrying relative cwd",
+                json.dumps({
+                    "op": "launch",
+                    "argv": ["/bin/true"],
+                    "cwd": "relative",
+                    "env": {},
+                }).encode()
+                + b"\n",
                 1,
                 "bad_request",
             ),

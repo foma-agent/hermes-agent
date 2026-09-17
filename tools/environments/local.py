@@ -780,8 +780,18 @@ class LocalEnvironment(BaseEnvironment):
         from hermes_cli.config import load_config_readonly
 
         terminal_cfg = (load_config_readonly() or {}).get("terminal") or {}
-        broker_cfg = terminal_cfg.get("local_exec_broker") or {}
-        self._local_exec_broker_socket = broker_cfg.get("socket") or None
+        if "local_exec_broker" in terminal_cfg:
+            broker_cfg = terminal_cfg["local_exec_broker"]
+            broker_socket = (
+                broker_cfg.get("socket") if isinstance(broker_cfg, dict) else None
+            )
+            if not isinstance(broker_socket, str) or not broker_socket:
+                raise EnvironmentConnectionError(
+                    "terminal.local_exec_broker requires a non-empty string socket"
+                )
+            self._local_exec_broker_socket = broker_socket
+        else:
+            self._local_exec_broker_socket = None
         self.init_session()
 
     def get_temp_dir(self) -> str:
@@ -863,6 +873,7 @@ class LocalEnvironment(BaseEnvironment):
 
             stdout_r, stdout_w = os.pipe()
             stdin_r = stdin_w = None
+            conn = None
             if stdin_data is not None:
                 stdin_r, stdin_w = os.pipe()
             try:
@@ -876,7 +887,21 @@ class LocalEnvironment(BaseEnvironment):
                     stdout_fd=stdout_w,
                     timeout=timeout,
                 )
+                pid = reply.get("pid")
+                if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                    raise BrokerError(
+                        "bad_reply", "broker returned an invalid launch reply"
+                    )
+                os.close(stdout_w)
+                stdout_w = None
+                if stdin_r is not None:
+                    os.close(stdin_r)
+                    stdin_r = None
+                proc = _BrokerProcessHandle(conn, pid, stdout_r, stdin_w)
             except BaseException as exc:
+                if conn is not None:
+                    with contextlib.suppress(OSError):
+                        conn.close()
                 for fd in (stdout_r, stdout_w, stdin_r, stdin_w):
                     if fd is not None:
                         with contextlib.suppress(OSError):
@@ -890,10 +915,6 @@ class LocalEnvironment(BaseEnvironment):
                         ),
                     ) from exc
                 raise
-            os.close(stdout_w)
-            if stdin_r is not None:
-                os.close(stdin_r)
-            proc = _BrokerProcessHandle(conn, int(reply["pid"]), stdout_r, stdin_w)
             if stdin_data is not None:
                 _pipe_stdin(proc, stdin_data)
             return proc

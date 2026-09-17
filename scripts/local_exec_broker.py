@@ -358,6 +358,10 @@ def _validated(request):
             raise BrokerError(
                 "bad_request", "argv launches require a non-empty 'cwd' without NUL"
             )
+        if not os.path.isabs(cwd):
+            raise BrokerError(
+                "bad_request", "argv launch 'cwd' must be an absolute path"
+            )
         try:
             os.fsencode(cwd)
         except UnicodeEncodeError as exc:
