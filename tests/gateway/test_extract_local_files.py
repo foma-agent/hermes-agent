@@ -162,6 +162,22 @@ class TestTextCleanup:
         assert "after" in cleaned
         assert "/tmp/x.png" not in cleaned
 
+    def test_only_delivered_path_occurrence_is_removed(self):
+        text = (
+            "Attach /tmp/out.csv.\n"
+            "Use `pandas.read_csv('/tmp/out.csv')`\n"
+            "Mirror https://cdn.example.com/tmp/out.csv"
+        )
+
+        paths, cleaned = _extract(text)
+
+        assert paths == ["/tmp/out.csv"]
+        assert cleaned == (
+            "Attach .\n"
+            "Use `pandas.read_csv('/tmp/out.csv')`\n"
+            "Mirror https://cdn.example.com/tmp/out.csv"
+        )
+
     def test_excessive_blank_lines_collapsed(self):
         text = "Before\n\n\n/tmp/x.png\n\n\nAfter"
         _, cleaned = _extract(text)

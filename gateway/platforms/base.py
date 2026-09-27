@@ -3297,22 +3297,22 @@ class BasePlatformAdapter(ABC):
             r'(?<![/:\w.])(?:~/|/|[A-Za-z]:[/\\])(?:[\w.\-]+[/\\])*[\w.\-]+\.(?:' + ext_part + r')\b',
             re.IGNORECASE)
         code_spans = _code_spans(content)
-        unique: dict = {}  # expanded_path -> raw_match_text, deduped in discovery order
+        unique: dict = {}  # expanded_path -> None, deduped in discovery order
+        removal_spans = []
         for match in path_re.finditer(content):
             if any(s <= match.start() < e for s, e in code_spans):
                 continue
             raw = match.group(0)
             expanded = os.path.expanduser(raw)
             if os.path.isfile(expanded):
-                unique.setdefault(expanded, raw)
+                unique.setdefault(expanded, None)
+                removal_spans.append(match.span())
             else:
                 # Most common reason a promised file never arrives — log the gap.
                 logger.info("Skipping bare file path in reply (no file on disk): %s", _log_safe_path(raw))
         if not unique:
             return [], content
-        cleaned = content
-        for raw in unique.values():
-            cleaned = cleaned.replace(raw, '')
+        cleaned = _delete_spans(content, removal_spans)
         return list(unique), re.sub(r'\n{3,}', '\n\n', cleaned).strip()
 
     async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None,
