@@ -605,6 +605,12 @@ _COMMAND_WRAPPER_NON_EXECUTING_OPTIONS = {
     "command": {"-v", "-V"}, "chrt": {"-p", "--pid"},
     "ionice": {"-p", "--pid", "--pgid", "--uid"}, "taskset": {"-p", "--pid"},
 }
+_XARGS_SHORT_OPTIONS_WITH_ARG = frozenset(
+    option[1]
+    for option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG["xargs"]
+    if option.startswith("-") and not option.startswith("--") and len(option) == 2
+)
+_XARGS_SHORT_OPTIONS_WITH_OPTIONAL_ARG = frozenset("eil")
 _COMMAND_WRAPPER_POSITIONAL_ARGS = {"chroot": 1, "chrt": 1, "taskset": 1, "timeout": 1}
 _SHELL_COMMAND_TRANSITIONS = {"if", "then", "else", "elif", "do", "while", "until", "!"}
 _SHELL_REDIRECTION_RE = re.compile(r"(?:[0-9]+)?(?:>>|<<|<>|>&|<&|>\||[<>])")
@@ -1228,6 +1234,28 @@ def _mask_quoted_newlines_span(command: str, start: int, end: int) -> str:
     return "".join(out)
 
 
+def _wrapper_option_consumes_next_arg(wrapper: str, token: str) -> bool:
+    """Whether a wrapper option owns the following argv word."""
+    option = token.split("=", 1)[0]
+    if "=" in token:
+        return False
+    if option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG.get(wrapper, set()):
+        return True
+    if wrapper != "xargs" or option.startswith("--"):
+        return False
+    # GNU/BSD xargs accept clustered short options. The first option with an
+    # argument owns the rest of its token; only a required owner at the end
+    # consumes the next word. Deprecated -e/-i/-l take optional attached-only
+    # arguments, so they stop the cluster without swallowing the command.
+    chars = option[1:]
+    for index, char in enumerate(chars):
+        if char in _XARGS_SHORT_OPTIONS_WITH_OPTIONAL_ARG:
+            return False
+        if char in _XARGS_SHORT_OPTIONS_WITH_ARG:
+            return index == len(chars) - 1
+    return False
+
+
 def _iter_shell_command_word_spans(command: str):
     """Yield command-position words that may be executable names."""
     for pos in _iter_shell_command_starts(command):
@@ -1260,7 +1288,7 @@ def _iter_shell_command_word_spans(command: str):
                 if option in queries or (wrapper == "command" and not option.startswith("--")
                                          and set(option[1:]) & {"v", "V"}):
                     break
-                skip_arg = "=" not in deobfuscated and option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG.get(wrapper, set())
+                skip_arg = _wrapper_option_consumes_next_arg(wrapper, deobfuscated)
                 continue
             if positionals:
                 if required_positional is not None and deobfuscated != required_positional:

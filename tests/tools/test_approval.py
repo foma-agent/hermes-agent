@@ -561,6 +561,21 @@ class TestHermesConfigWriteProtection:
         assert key == "modify Hermes security policy via config"
         assert desc == key
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "xargs -tn 1 hermes config set approvals.mode off",
+            "xargs -tI {} hermes config unset security.tirith_enabled",
+            "xargs -0P 4 hermes config set command_allowlist []",
+        ],
+    )
+    def test_policy_mutation_xargs_clustered_argument_options(self, command):
+        dangerous, key, desc = detect_dangerous_command(command)
+
+        assert dangerous is True, command
+        assert key == "modify Hermes security policy via config"
+        assert desc == key
+
     def test_policy_mutation_eval_payload_keeps_one_shot_key(self):
         command = 'eval "hermes config set command_allowlist []"'
 
