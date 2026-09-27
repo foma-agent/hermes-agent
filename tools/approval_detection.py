@@ -593,9 +593,9 @@ _COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
     "timeout": {"-k", "--kill-after", "-s", "--signal"},
     "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
     "ionice": {"-c", "--class", "-n", "--classdata"},
-    "xargs": {"-a", "--arg-file", "-d", "--delimiter", "-E", "-e", "--eof", "-I", "-i", "--replace",
-              "-J", "-L", "-l", "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-R", "-S",
-              "-s", "--max-chars", "--process-slot-var"},
+    "xargs": {"-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-J", "-L", "--max-lines",
+              "-n", "--max-args", "-P", "--max-procs", "-R", "-S", "-s", "--max-chars",
+              "--process-slot-var"},
     "uv": {"--directory", "--project", "--config-file", "--python", "--with", "--with-editable",
            "--with-requirements", "--env-file", "--package"},
     "poetry": {"-C", "--directory", "-P", "--project"},
@@ -1603,20 +1603,31 @@ def _security_config_runner_payload_start(tokens: list[str]) -> int | None:
 
 def _is_hermes_security_config_mutation(command: str) -> bool:
     """Parse command-position argv so shell quoting cannot hide a config mutation."""
-    for word_start, _, _ in _iter_shell_command_word_spans(command):
-        tokens = _shell_segment_tokens(_shell_command_segment(command, word_start), 0)
-        if not tokens:
+    pending, seen = [command], set()
+    while pending:
+        source = pending.pop()
+        if source in seen:
             continue
-        if _security_config_entrypoint_mutation(tokens):
-            return True
-        payload_start = _security_config_runner_payload_start(tokens)
-        if payload_start is None:
-            continue
-        if any(
-            _security_config_entrypoint_mutation(tokens[index:])
-            for index in range(payload_start, len(tokens))
-        ):
-            return True
+        seen.add(source)
+        for word_start, _, _ in _iter_shell_command_word_spans(source):
+            tokens = _shell_segment_tokens(_shell_command_segment(source, word_start), 0)
+            if not tokens:
+                continue
+            if _security_config_entrypoint_mutation(tokens):
+                return True
+            payload_start = _security_config_runner_payload_start(tokens)
+            if payload_start is not None and any(
+                _security_config_entrypoint_mutation(tokens[index:])
+                for index in range(payload_start, len(tokens))
+            ):
+                return True
+            # eval concatenates its argv with spaces and parses the result as shell code.
+            # Re-scan that bounded, strictly shorter payload instead of treating a quoted
+            # policy mutation as inert argument data.
+            if os.path.basename(tokens[0]).lower() == "eval" and len(tokens) > 1:
+                payload = " ".join(tokens[1:])
+                if payload not in seen:
+                    pending.append(payload)
     return False
 
 
