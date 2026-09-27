@@ -477,6 +477,110 @@ class TestHermesConfigWriteProtection:
             assert dangerous is True, command
             assert key is not None, command
 
+    def test_policy_mutation_cli_requires_approval(self):
+        dangerous, key, desc = detect_dangerous_command(
+            "hermes config set approvals.mode off"
+        )
+
+        assert dangerous is True
+        assert key == "modify Hermes security policy via config"
+        assert desc == key
+
+    @pytest.mark.parametrize("action", ["set", "unset"])
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "approvals.mode",
+            "security.tirith_enabled",
+            "command_allowlist",
+            "yolo",
+        ],
+    )
+    def test_policy_mutation_cli_protected_keys(self, action, key):
+        value = " false" if action == "set" else ""
+        dangerous, pattern_key, desc = detect_dangerous_command(
+            f"hermes config {action} {key}{value}"
+        )
+
+        assert dangerous is True
+        assert pattern_key == "modify Hermes security policy via config"
+        assert desc == pattern_key
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "hermes --profile prod config unset security.tirith_enabled",
+            "hermes -p prod config set command_allowlist '[\"git status\"]'",
+            "hermes --reasoning high config set approvals.mode off",
+            "hermes config --profile=prod set --force approvals.mode off",
+            "hermes config set -- approvals.mode off",
+            "hermes config set 'approvals'.mode off",
+            'hermes config set ap"provals".mode off',
+            'hermes config set approvals".mode" off',
+        ],
+    )
+    def test_policy_mutation_cli_flags_and_quoting(self, command):
+        dangerous, key, desc = detect_dangerous_command(command)
+
+        assert dangerous is True, command
+        assert key == "modify Hermes security policy via config"
+        assert desc == key
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python -m hermes_cli.main config set approvals.mode off",
+            "python -mhermes_cli.main config unset security.tirith_enabled",
+            "python -u -m hermes_cli.main config set yolo true",
+            "python -Im hermes_cli.main config set command_allowlist '[]'",
+            "python hermes_cli/main.py config set approvals.mode off",
+            "/usr/bin/python ./hermes_cli/main.py config unset security.tirith_enabled",
+        ],
+    )
+    def test_policy_mutation_python_entrypoints(self, command):
+        dangerous, key, desc = detect_dangerous_command(command)
+
+        assert dangerous is True, command
+        assert key == "modify Hermes security policy via config"
+        assert desc == key
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "hermes config get approvals.mode",
+            "hermes config get display.show_cost",
+            "hermes config set display.show_cost true",
+            "hermes config unset display.show_cost",
+            "python -m hermes_cli.main config set display.show_cost true",
+        ],
+    )
+    def test_ordinary_config_cli_operations_stay_safe(self, command):
+        assert detect_dangerous_command(command) == (False, None, None)
+
+    def test_policy_mutation_ignores_session_permanent_and_preloaded_approvals(self):
+        _, key, _ = detect_dangerous_command("hermes config set approvals.mode off")
+        session_key = "policy-mutation-preloaded"
+        previous_session = approval_module._session_approved.get(session_key)
+        previous_permanent = set(approval_module._permanent_approved)
+
+        try:
+            approve_session(session_key, key)
+            approval_module.approve_permanent(key)
+            load_permanent({key})
+            assert key not in approval_module._session_approved.get(session_key, set())
+            assert key not in approval_module._permanent_approved
+
+            # Older processes or fixtures may already contain the key; reads still fail closed.
+            approval_module._session_approved[session_key] = {key}
+            approval_module._permanent_approved.add(key)
+            assert is_approved(session_key, key) is False
+        finally:
+            if previous_session is None:
+                approval_module._session_approved.pop(session_key, None)
+            else:
+                approval_module._session_approved[session_key] = previous_session
+            approval_module._permanent_approved.clear()
+            approval_module._permanent_approved.update(previous_permanent)
 
     def test_reads_and_unrelated_writes_are_safe(self):
         # Reading config is not a write; a non-Hermes absolute config.yaml is

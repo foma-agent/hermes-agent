@@ -26,6 +26,7 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
+_SECURITY_CONFIG_APPROVAL_KEY = "modify Hermes security policy via config"
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
@@ -1475,6 +1476,92 @@ def _command_detection_variants(command: str):
         pending = carry
 
 
+def _security_config_argv_mutation(argv: list[str]) -> bool:
+    """Whether dequoted Hermes argv writes an approval/security config namespace."""
+    without_profiles, index = [], 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--profile", "-p"}:
+            index += 2
+            continue
+        if token.startswith("--profile="):
+            index += 1
+            continue
+        without_profiles.append(token)
+        index += 1
+
+    for index, token in enumerate(without_profiles):
+        if token != "config" or index + 1 >= len(without_profiles):
+            continue
+        if without_profiles[index + 1] not in {"set", "unset"}:
+            continue
+        key_index = index + 2
+        while key_index < len(without_profiles) and without_profiles[key_index] in {"--", "--force"}:
+            key_index += 1
+        if key_index >= len(without_profiles):
+            continue
+        key = without_profiles[key_index]
+        if key == "yolo" or any(
+            key == namespace or key.startswith(namespace + ".")
+            for namespace in ("approvals", "security", "command_allowlist")
+        ):
+            return True
+    return False
+
+
+def _python_hermes_module_argv(tokens: list[str]) -> list[str] | None:
+    """Return argv after a supported Python Hermes entrypoint, else None."""
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-m":
+            if index + 1 < len(tokens) and tokens[index + 1] == "hermes_cli.main":
+                return tokens[index + 2:]
+            return None
+        if token.startswith("-m") and token[2:] == "hermes_cli.main":
+            return tokens[index + 1:]
+        if token.startswith("-") and not token.startswith("--"):
+            short_flags = token[1:]
+            module_flag = short_flags.find("m")
+            if module_flag >= 0 and not any(flag in "cWX" for flag in short_flags[:module_flag]):
+                attached_module = short_flags[module_flag + 1:]
+                if attached_module:
+                    return tokens[index + 1:] if attached_module == "hermes_cli.main" else None
+                if index + 1 < len(tokens) and tokens[index + 1] == "hermes_cli.main":
+                    return tokens[index + 2:]
+                return None
+        if token == "--":
+            return None
+        if not token.startswith("-"):
+            script = token.replace("\\", "/")
+            return tokens[index + 1:] if script.endswith("hermes_cli/main.py") else None
+        option = token.split("=", 1)[0]
+        if "=" not in token and option in _INTERPRETER_WITH_ARG["python"]:
+            index += 2
+        else:
+            index += 1
+    return None
+
+
+def _is_hermes_security_config_mutation(command: str) -> bool:
+    """Parse command-position argv so shell quoting cannot hide a config mutation."""
+    for word_start, _, _ in _iter_shell_command_word_spans(command):
+        tokens = _shell_segment_tokens(_shell_command_segment(command, word_start), 0)
+        if not tokens:
+            continue
+        if os.path.basename(tokens[0]).lower() in {"hermes", "hermes.exe"}:
+            argv = tokens[1:]
+        elif _interpreter_family(tokens[0]) == "python":
+            argv = _python_hermes_module_argv(tokens)
+            if argv is None:
+                continue
+        else:
+            continue
+        if _security_config_argv_mutation(argv):
+            return True
+    return False
+
+
 def _is_verification_artifact_cleanup(command: str) -> bool:
     """Return whether *command* only removes one Hermes ad-hoc temp script."""
     try:
@@ -1520,6 +1607,8 @@ def detect_dangerous_command(command: str) -> tuple:
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
     for command_variant in _command_detection_variants(command):
+        if _is_hermes_security_config_mutation(command_variant):
+            return (True, _SECURITY_CONFIG_APPROVAL_KEY, _SECURITY_CONFIG_APPROVAL_KEY)
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
