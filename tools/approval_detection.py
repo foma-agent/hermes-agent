@@ -593,8 +593,8 @@ _COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
     "timeout": {"-k", "--kill-after", "-s", "--signal"},
     "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
     "ionice": {"-c", "--class", "-n", "--classdata"},
-    "xargs": {"-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-J", "-L", "--max-lines",
-              "-n", "--max-args", "-P", "--max-procs", "-R", "-S", "-s", "--max-chars",
+    "xargs": {"-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-J", "-L", "-n",
+              "--max-args", "-P", "--max-procs", "-R", "-S", "-s", "--max-chars",
               "--process-slot-var"},
     "uv": {"--directory", "--project", "--config-file", "--python", "--with", "--with-editable",
            "--with-requirements", "--env-file", "--package"},
@@ -1429,11 +1429,15 @@ def _command_detection_variants(command: str):
         return True
 
     # Windows-path variant: normalization strips backslashes as shell escapes, so `del C:\Users\me\.ssh\id_rsa`
-    # reaches the patterns as `del C:Usersme.sshid_rsa`. When the RAW command has a drive-letter or UNC backslash
-    # path, also yield a variant with backslashes flattened to `/` BEFORE normalization. Gated on a real path shape so
-    # POSIX escape semantics (`echo a\"b`) are untouched elsewhere.
+    # reaches the patterns as `del C:Usersme.sshid_rsa`. When the RAW command has a drive-letter, UNC, or
+    # dot-relative backslash path, also yield a variant with backslashes flattened to `/` BEFORE normalization.
+    # Gated on a real path shape so POSIX escape semantics (`echo a\"b`) are untouched elsewhere.
     # See #69472.
-    if re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command) or re.search(r"[A-Za-z]:\\", command):
+    if (
+        re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command)
+        or re.search(r"[A-Za-z]:\\", command)
+        or ".\\" in command
+    ):
         win_variant = _normalize_command_for_detection(_mask_quoted_newlines(command.replace("\\", "/")))
         if fresh(win_variant):
             yield win_variant
