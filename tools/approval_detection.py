@@ -594,8 +594,8 @@ _COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
     "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
     "ionice": {"-c", "--class", "-n", "--classdata"},
     "xargs": {"-a", "--arg-file", "-d", "--delimiter", "-E", "-e", "--eof", "-I", "-i", "--replace",
-              "-L", "-l", "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
-              "--process-slot-var"},
+              "-J", "-L", "-l", "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-R", "-S",
+              "-s", "--max-chars", "--process-slot-var"},
     "uv": {"--directory", "--project", "--config-file", "--python", "--with", "--with-editable",
            "--with-requirements", "--env-file", "--package"},
     "poetry": {"-C", "--directory", "-P", "--project"},
@@ -1558,21 +1558,64 @@ def _python_hermes_module_argv(tokens: list[str]) -> list[str] | None:
     return None
 
 
+def _security_config_entrypoint_mutation(tokens: list[str]) -> bool:
+    """Whether tokens begin with a Hermes CLI entrypoint that mutates policy."""
+    if not tokens:
+        return False
+    if os.path.basename(tokens[0]).lower() in {"hermes", "hermes.exe"}:
+        argv = tokens[1:]
+    elif _interpreter_family(tokens[0]) == "python":
+        argv = _python_hermes_module_argv(tokens)
+        if argv is None:
+            return False
+    else:
+        return False
+    return _security_config_argv_mutation(argv)
+
+
+def _security_config_runner_payload_start(tokens: list[str]) -> int | None:
+    """Locate argv payloads for runners whose option grammars change independently.
+
+    Security-policy detection scans the payload instead of trusting an inevitably
+    incomplete table of third-party options. That can prompt on ambiguous runner
+    argv, but it cannot silently lose the real Hermes entrypoint.
+    """
+    if not tokens:
+        return None
+    runner = os.path.basename(tokens[0]).lower()
+    if runner in {"uvx", "uvx.exe"}:
+        return 1
+    if runner in {"uv", "uv.exe"}:
+        for index, token in enumerate(tokens[1:], 1):
+            if token == "run":
+                return index + 1
+            if token == "tool" and index + 1 < len(tokens) and tokens[index + 1] in {"run", "uvx"}:
+                return index + 2
+        return None
+    if runner in {"poetry", "poetry.exe", "pipx", "pipx.exe", "pdm", "pdm.exe",
+                  "hatch", "hatch.exe", "rye", "rye.exe", "pipenv", "pipenv.exe"}:
+        try:
+            return tokens.index("run", 1) + 1
+        except ValueError:
+            return None
+    return None
+
+
 def _is_hermes_security_config_mutation(command: str) -> bool:
     """Parse command-position argv so shell quoting cannot hide a config mutation."""
     for word_start, _, _ in _iter_shell_command_word_spans(command):
         tokens = _shell_segment_tokens(_shell_command_segment(command, word_start), 0)
         if not tokens:
             continue
-        if os.path.basename(tokens[0]).lower() in {"hermes", "hermes.exe"}:
-            argv = tokens[1:]
-        elif _interpreter_family(tokens[0]) == "python":
-            argv = _python_hermes_module_argv(tokens)
-            if argv is None:
-                continue
-        else:
+        if _security_config_entrypoint_mutation(tokens):
+            return True
+        payload_start = _security_config_runner_payload_start(tokens)
+        if payload_start is None:
             continue
-        if _security_config_argv_mutation(argv):
+        if any(
+            _security_config_entrypoint_mutation(tokens[index:])
+            for index in range(payload_start, len(tokens))
+        ):
             return True
     return False
 

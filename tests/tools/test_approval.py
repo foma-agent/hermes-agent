@@ -530,11 +530,18 @@ class TestHermesConfigWriteProtection:
         "command",
         [
             "uv run hermes config set approvals.mode off",
+            "uv run -p 3.12 hermes config set approvals.mode off",
+            "uv --cache-dir /tmp/c run hermes config set approvals.mode off",
+            "uv --color always run hermes config unset security.tirith_enabled",
             "uv --directory /tmp run --no-project hermes config unset security.tirith_enabled",
+            "uv tool run --from . hermes config unset security.tirith_enabled",
+            "uvx --from . hermes config set approvals.mode off",
+            "uv run python -m hermes_cli.main config set yolo true",
             "poetry run hermes config set command_allowlist '[]'",
             "pipx run hermes config set yolo true",
             "xargs hermes config unset security.tirith_enabled",
             "xargs -n 1 hermes config set approvals.mode off",
+            "xargs -J % hermes config unset security.tirith_enabled",
         ],
     )
     def test_policy_mutation_cli_runner_entrypoints(self, command):
