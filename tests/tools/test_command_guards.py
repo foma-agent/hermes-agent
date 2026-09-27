@@ -170,6 +170,66 @@ class TestTirithAllowDangerous:
         _, pattern_key, _ = approval_module.detect_dangerous_command(command)
         assert is_approved(session_key, pattern_key) is False
 
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_policy_mutation_ignores_command_prefix_allowlist(self, mock_tirith, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.setattr(approval_module, "_command_matches_permanent_allowlist", lambda command: True)
+        callback = MagicMock(return_value="deny")
+        command = "hermes config set approvals.mode off"
+
+        combined = check_all_command_guards(command, "local", approval_callback=callback)
+        pattern_only = check_dangerous_command(command, "local", approval_callback=callback)
+
+        assert combined["approved"] is False
+        assert pattern_only["approved"] is False
+        assert callback.call_count == 2
+        assert all(call.kwargs["allow_session"] is False for call in callback.call_args_list)
+        assert all(call.kwargs["allow_permanent"] is False for call in callback.call_args_list)
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_policy_mutation_pending_payload_is_one_shot(self, mock_tirith, monkeypatch):
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        session_key = "policy-mutation-pending-one-shot"
+        token = set_current_session_key(session_key)
+
+        try:
+            result = check_all_command_guards(
+                "hermes config set approvals.mode off",
+                "local",
+            )
+            pending = approval_module._pending[session_key]
+        finally:
+            reset_current_session_key(token)
+
+        assert result["approval_pending"] is True
+        assert result["allow_session"] is False
+        assert result["allow_permanent"] is False
+        assert pending["allow_session"] is False
+        assert pending["allow_permanent"] is False
+
+    @patch(
+        _TIRITH_PATCH,
+        return_value=_tirith_result(
+            "warn", [{"rule_id": "policy-mutation-mixed"}], "additional security warning"
+        ),
+    )
+    def test_policy_mutation_mixed_prompt_persists_no_warning_keys(self, mock_tirith, monkeypatch):
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        session_key = "policy-mutation-mixed-one-shot"
+        token = set_current_session_key(session_key)
+
+        try:
+            result = check_all_command_guards(
+                "hermes config set approvals.mode off",
+                "local",
+                approval_callback=MagicMock(return_value="session"),
+            )
+        finally:
+            reset_current_session_key(token)
+
+        assert result["approved"] is True
+        assert is_approved(session_key, "tirith:policy-mutation-mixed") is False
+
 
 # ---------------------------------------------------------------------------
 # tirith warn + safe command

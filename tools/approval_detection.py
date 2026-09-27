@@ -576,7 +576,11 @@ _PARAM_DEFAULT_RE = re.compile(r"\$\{[^}:}\s]+:-(?P<default>[^}]*)\}")
 _SIMPLE_SHELL_LITERAL_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _COMMAND_WRAPPER_WORDS = {"sudo", "env", "exec", "nohup", "setsid", "time", "command", "builtin",
-                          "nice", "timeout", "stdbuf", "ionice", "chrt", "taskset", "chroot"}
+                          "nice", "timeout", "stdbuf", "ionice", "chrt", "taskset", "chroot", "xargs",
+                          "uv", "poetry", "pipx"}
+# These package runners execute argv only through their ``run`` subcommand. Treating every
+# subcommand as a wrapper would turn data following e.g. ``uv sync`` into an executable.
+_COMMAND_WRAPPER_REQUIRED_POSITIONAL = {"uv": "run", "poetry": "run", "pipx": "run"}
 _SUDO_OPTIONS_WITH_ARG = {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-u", "--user"}
 # Adapted from embwl0x's command-position work in #76063. Option operands are
 # data, not executable positions; option spelling remains case-sensitive.
@@ -589,6 +593,13 @@ _COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
     "timeout": {"-k", "--kill-after", "-s", "--signal"},
     "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
     "ionice": {"-c", "--class", "-n", "--classdata"},
+    "xargs": {"-a", "--arg-file", "-d", "--delimiter", "-E", "-e", "--eof", "-I", "-i", "--replace",
+              "-L", "-l", "--max-lines", "-n", "--max-args", "-P", "--max-procs", "-s", "--max-chars",
+              "--process-slot-var"},
+    "uv": {"--directory", "--project", "--config-file", "--python", "--with", "--with-editable",
+           "--with-requirements", "--env-file", "--package"},
+    "poetry": {"-C", "--directory", "-P", "--project"},
+    "pipx": {"--index-url", "--pip-args", "--python", "--spec", "--suffix"},
 }
 _COMMAND_WRAPPER_NON_EXECUTING_OPTIONS = {
     "command": {"-v", "-V"}, "chrt": {"-p", "--pid"},
@@ -1220,7 +1231,7 @@ def _mask_quoted_newlines_span(command: str, start: int, end: int) -> str:
 def _iter_shell_command_word_spans(command: str):
     """Yield command-position words that may be executable names."""
     for pos in _iter_shell_command_starts(command):
-        wrapper, positionals = None, 0
+        wrapper, positionals, required_positional = None, 0, None
         options, skip_arg = True, False
         while pos < len(command):
             redirect = _SHELL_REDIRECTION_RE.match(command, _skip_shell_whitespace(command, pos))
@@ -1252,6 +1263,9 @@ def _iter_shell_command_word_spans(command: str):
                 skip_arg = "=" not in deobfuscated and option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG.get(wrapper, set())
                 continue
             if positionals:
+                if required_positional is not None and deobfuscated != required_positional:
+                    break
+                required_positional = None
                 positionals -= 1
                 continue
             if _ENV_ASSIGNMENT_RE.fullmatch(word):
@@ -1260,7 +1274,8 @@ def _iter_shell_command_word_spans(command: str):
             if name not in _COMMAND_WRAPPER_WORDS:
                 break
             wrapper, options = name, True
-            positionals = _COMMAND_WRAPPER_POSITIONAL_ARGS.get(name, 0)
+            required_positional = _COMMAND_WRAPPER_REQUIRED_POSITIONAL.get(name)
+            positionals = max(_COMMAND_WRAPPER_POSITIONAL_ARGS.get(name, 0), int(required_positional is not None))
 
 
 def _shell_command_segment(command: str, start: int) -> str:
