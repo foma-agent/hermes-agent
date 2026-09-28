@@ -588,6 +588,20 @@ class TestHermesConfigWriteProtection:
     @pytest.mark.parametrize(
         "command",
         [
+            "sh -c 'hermes config set approvals.mode off' ; git push --force",
+            r".\hermes.exe config unset security.tirith_enabled && echo x >> ~/.bashrc",
+        ],
+    )
+    def test_policy_mutation_key_wins_across_detection_variants(self, command):
+        dangerous, key, desc = detect_dangerous_command(command)
+
+        assert dangerous is True, command
+        assert key == "modify Hermes security policy via config"
+        assert desc == key
+
+    @pytest.mark.parametrize(
+        "command",
+        [
             r".\hermes.exe config set approvals.mode off",
             r".\uv.exe run hermes config unset security.tirith_enabled",
             r".\poetry.exe run hermes config set command_allowlist []",

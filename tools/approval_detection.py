@@ -1707,9 +1707,13 @@ def detect_dangerous_command(command: str) -> tuple:
         return (True, _PARSER_LIMIT_DESCRIPTION, _PARSER_LIMIT_DESCRIPTION)
     if _is_verification_artifact_cleanup(command):
         return (False, None, None)
+    # A policy mutation is always one-shot. Search every executable projection
+    # before returning a generic match from an earlier variant, or a co-flagged
+    # force-push/redirect could supply a persistable key for the same command.
     for command_variant in _command_detection_variants(command):
         if _is_hermes_security_config_mutation(command_variant):
             return (True, _SECURITY_CONFIG_APPROVAL_KEY, _SECURITY_CONFIG_APPROVAL_KEY)
+    for command_variant in _command_detection_variants(command):
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None
         for pattern_re, description in DANGEROUS_PATTERNS_COMPILED:
