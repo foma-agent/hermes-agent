@@ -1465,6 +1465,7 @@ def _command_detection_variants(command: str):
         re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command)
         or re.search(r"[A-Za-z]:\\", command)
         or ".\\" in command
+        or re.search(r"(?:^|[\s;&|()])(?:[^\\\s;&|()\"'`]+\\)+[^\\\s;&|()\"'`]+", command)
     ):
         win_variant = _normalize_command_for_detection(_mask_quoted_newlines(command.replace("\\", "/")))
         if fresh(win_variant):

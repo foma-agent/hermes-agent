@@ -603,6 +603,7 @@ class TestHermesConfigWriteProtection:
         "command",
         [
             r".\hermes.exe config set approvals.mode off",
+            r"venv\Scripts\hermes.exe config set approvals.mode off",
             r".\uv.exe run hermes config unset security.tirith_enabled",
             r".\poetry.exe run hermes config set command_allowlist []",
         ],
