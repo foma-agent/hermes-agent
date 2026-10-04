@@ -50,16 +50,16 @@ jobs:
             pyproject.toml
             uv.lock
 
-      - name: Set up Python 3.11
-        run: uv python install 3.11
+      - name: Set up Python 3.14
+        run: uv python install 3.14
 
       - name: Install dependencies
         uses: ./.github/actions/retry
         with:
           command: >-
-            uv sync --locked --python 3.11 --extra all --extra dev
+            uv sync --locked --python 3.14 --extra all --group dev
             --extra anthropic --extra mistral --extra fal --extra modal
-            --extra daytona --extra hindsight --extra parallel-web
+            --extra daytona --extra parallel-web
 
       - name: Run the Docker environment file on native Windows
         run: >-
