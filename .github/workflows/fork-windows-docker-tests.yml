@@ -61,10 +61,11 @@ jobs:
             --extra anthropic --extra mistral --extra fal --extra modal
             --extra daytona --extra parallel-web
 
-      - name: Run the Docker environment file on native Windows
+      - name: Run the Docker environment files on native Windows
         run: >-
           uv run --no-sync python -m pytest
           tests/tools/test_docker_environment.py
+          tests/tools/test_docker_environment_reuse.py
           -m "not integration" -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
