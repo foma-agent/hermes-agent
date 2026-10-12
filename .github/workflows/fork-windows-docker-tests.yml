@@ -52,6 +52,7 @@ jobs:
         with:
           repository: NousResearch/hermes-agent
           ref: ${{ inputs.ref }}
+          persist-credentials: false
 
       - name: Verify exact checkout
         shell: bash
@@ -71,10 +72,9 @@ jobs:
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
         with:
           version: "0.9.28"
-          enable-cache: true
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
+          # The checked-out commit may be an untrusted contributor head. Do not
+          # let its install or tests write a cache restored by later fork jobs.
+          enable-cache: false
 
       - name: Set up Python 3.14
         run: uv python install 3.14
