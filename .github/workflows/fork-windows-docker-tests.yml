@@ -1,8 +1,9 @@
-name: "Fork: Windows Docker tests"
+name: "Fork: Windows targeted tests"
 
 # The upstream PR workflow is approval-gated for fork contributions. This
-# fork-owned dispatcher gives an exact commit a native Windows acceptance run
-# without changing the product branch or copying its code into the workflow.
+# fork-owned dispatcher gives an exact upstream commit a native Windows
+# acceptance run without changing the product branch or copying its code into
+# the workflow.
 on:
   workflow_dispatch:
     inputs:
@@ -10,17 +11,25 @@ on:
         description: "Exact commit SHA to test"
         required: true
         type: string
+      suite:
+        description: "Named test suite"
+        required: true
+        default: docker
+        type: choice
+        options:
+          - docker
+          - profile-scratch
 
 permissions:
   contents: read
 
 concurrency:
-  group: fork-windows-docker-${{ inputs.ref }}
+  group: fork-windows-${{ inputs.suite }}-${{ inputs.ref }}
   cancel-in-progress: true
 
 jobs:
-  docker-environment:
-    name: Docker environment tests (Windows)
+  targeted-tests:
+    name: ${{ inputs.suite }} tests (Windows)
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -36,10 +45,27 @@ jobs:
 
       # workflow_dispatch is restricted to repository writers; the validation
       # above also prevents a branch name or shell-shaped value reaching checkout.
+      # The fixed public upstream lets this fork test another contributor's PR
+      # head without first republishing that commit under foma-agent.
       - name: Checkout exact commit
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          repository: NousResearch/hermes-agent
           ref: ${{ inputs.ref }}
+
+      - name: Verify exact checkout
+        shell: bash
+        env:
+          TARGET_SHA: ${{ inputs.ref }}
+        run: |
+          resolved_sha="$(git rev-parse HEAD)"
+          echo "target=$TARGET_SHA"
+          echo "resolved=$resolved_sha"
+          git log -1 --format='commit=%H subject=%s'
+          if [[ "$resolved_sha" != "$TARGET_SHA" ]]; then
+            echo "::error::checkout resolved $resolved_sha instead of $TARGET_SHA"
+            exit 1
+          fi
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
@@ -62,11 +88,27 @@ jobs:
             --extra daytona --extra parallel-web
 
       - name: Run the Docker environment files on native Windows
+        if: inputs.suite == 'docker'
         run: >-
           uv run --no-sync python -m pytest
           tests/tools/test_docker_environment.py
           tests/tools/test_docker_environment_reuse.py
           -m "not integration" -v --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Run the profile scratch files on native Windows
+        if: inputs.suite == 'profile-scratch'
+        run: >-
+          uv run --no-sync python -m pytest
+          tests/test_scratch_profile_pruning.py
+          tests/test_scratch_dir.py
+          tests/test_scratch_scan_failures.py
+          tests/test_hermes_bootstrap.py
+          tests/hermes_cli/test_apply_profile_override.py
+          -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
