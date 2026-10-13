@@ -19,6 +19,7 @@ on:
         options:
           - docker
           - profile-scratch
+          - scratch-dir
 
 permissions:
   contents: read
@@ -128,6 +129,17 @@ jobs:
           tests/test_scratch_scan_failures.py
           tests/test_hermes_bootstrap.py
           tests/hermes_cli/test_apply_profile_override.py
+          -v --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Run the scratch directory fixture on native Windows
+        if: inputs.suite == 'scratch-dir'
+        run: >-
+          uv run --no-sync python -m pytest
+          tests/test_scratch_dir.py
           -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
