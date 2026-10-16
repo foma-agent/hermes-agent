@@ -441,36 +441,20 @@ def _mark_tui_input_modes_active() -> None:
 
 
 def _prepare_deferred_agent_startup() -> None:
-    """Run Termux-deferred agent discovery before the first real agent turn."""
+    """Run Termux-deferred plugin discovery before the first real agent turn. MCP servers, shell
+    hooks and outbound webhooks belong to the gateway that runs the turn (session policy)."""
     global _deferred_agent_startup_done
     if _deferred_agent_startup_done:
         return
     if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
         return
     _deferred_agent_startup_done = True
-    _accept_hooks = os.environ.get("HERMES_ACCEPT_HOOKS", "").lower() in {"1", "true", "yes", "on"}
     try:
         from hermes_cli.plugins import discover_plugins
 
         discover_plugins()
     except Exception:
         logger.warning("plugin discovery failed at deferred CLI startup", exc_info=True)
-    try:
-        from hermes_cli.mcp_startup import start_background_mcp_discovery
-
-        start_background_mcp_discovery(logger=logger, thread_name="termux-cli-mcp-discovery")
-    except Exception:
-        logger.debug("MCP tool discovery failed at deferred CLI startup", exc_info=True)
-    try:
-        from agent.shell_hooks import register_from_config
-        from agent.outbound_webhooks import register_from_config as register_outbound_webhooks
-        from hermes_cli.config import load_config
-
-        _hooks_cfg = load_config()
-        register_from_config(_hooks_cfg, accept_hooks=_accept_hooks)
-        register_outbound_webhooks(_hooks_cfg)
-    except Exception:
-        logger.debug("shell-hook registration failed at deferred CLI startup", exc_info=True)
 
 
 _signal_watchdog_armed = False
@@ -896,7 +880,7 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
 
     # Seeded -q first message (see _should_seed_interactive); run() re-creates
     # _pending_input, so it is enqueued only after the fresh queue exists.
-    _seeded_first_message: Optional["_SeededQueryMessage"] = None
+    _seeded_first_message: Optional[_SeededQueryMessage] = None
     # Inspection surfaces (banner, /tools, status line) read this on partially built instances too.
     disabled_toolsets: Optional[list[str]] = None
 
@@ -1207,6 +1191,12 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         entry = self._slash_handler(canonical)
         if entry is None:
             return self._process_unregistered_slash(cmd_original, cmd_lower)
+        from hermes_cli.gateway_setting_commands import run as run_gateway_setting
+        if run_gateway_setting(self, canonical, cmd_original):
+            return True  # a per-session setting the gateway's handler applied
+        from hermes_cli.gateway_cli_commands import run as run_gateway_command
+        if run_gateway_command(self, canonical, cmd_original):
+            return True  # state the gateway session owns (checkpoints, .env, handoff)
         method_name, pass_arg = entry
         handler = getattr(self, method_name)
         result = handler(cmd_original) if pass_arg else handler()
@@ -1222,13 +1212,21 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         user_args = cmd_original[len(base_cmd):].strip()
         if bare in quick_commands:
             return self._run_quick_command(base_cmd, quick_commands[bare], user_args)
-        if bare in _get_plugin_cmd_handler_names():
-            self._run_plugin_slash_command(base_cmd, user_args)
-        elif base_cmd in skill_bundles:
+        from hermes_cli import gateway_plugin_commands
+        try:
+            plugin = gateway_plugin_commands.lookup(self, bare)  # the gateway's; None off the gateway
+        except gateway_plugin_commands.CatalogUnavailable:
+            return True  # printed; an unreadable catalog never selects a skill, bundle or expansion
+        gone = False
+        if plugin or (plugin is None and bare in _get_plugin_cmd_handler_names()):
+            gone = self._run_plugin_slash_command(base_cmd, user_args) is gateway_plugin_commands.GONE
+            if not gone:
+                return True
+        if base_cmd in skill_bundles:  # also a name a gateway plugin reload just dropped (GONE)
             self._run_skill_bundle_command(base_cmd, skill_bundles[base_cmd], user_args)
         elif base_cmd in skill_commands:
             self._run_skill_slash_command(base_cmd, skill_commands[base_cmd], user_args)
-        else:
+        elif not (gone and gateway_plugin_commands.report_gone(bare, skill_commands, skill_bundles)):
             return self._expand_slash_prefix(cmd_original, cmd_lower, skill_commands, skill_bundles)
         return True
 
@@ -1258,7 +1256,8 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             result = subprocess.run(
                 exec_cmd, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=30, env=build_subprocess_env(),
-                creationflags=windows_hide_flags(),  # no console flash on Windows (#56747)
+                creationflags=windows_hide_flags(),  # no console flash on Windows (#56747),
+                check=False,
             )
             # See #56747.
             output = result.stdout.strip() or result.stderr.strip()
@@ -1273,9 +1272,12 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             self._console_print(f"[bold red]{_t('cli.quick.error', error=str(e))}[/]")
         return True
 
-    def _run_plugin_slash_command(self, base_cmd: str, user_args: str) -> None:
+    def _run_plugin_slash_command(self, base_cmd: str, user_args: str):
+        from hermes_cli import gateway_plugin_commands
+        answered = gateway_plugin_commands.run(self, base_cmd.lstrip("/"), user_args)
+        if answered:
+            return answered  # ran beside the plugin's hooks, tools and MCP servers in the gateway, or GONE
         from hermes_cli.plugins import get_plugin_command_handler, resolve_plugin_command_result
-
         plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
         if not plugin_handler:
             return
@@ -1516,7 +1518,8 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
         for t in toolsets:
             toolsets_list.extend([x.strip() for x in t.split(",")] if isinstance(t, str) else [str(t)])
     elif not toolsets:
-        # Coding posture inside a code workspace, else the shared platform resolver.
+        # Coding posture inside a code workspace, else the shared platform resolver. Neither is a
+        # pick: the gateway resolves both from the session's cwd, so this list only feeds the display.
         try:
             from agent.coding_context import coding_selection
             toolsets_list = coding_selection(platform="cli", config=CLI_CONFIG)
@@ -1552,6 +1555,10 @@ def _build_cli_from_args(model, toolsets, provider, reasoning, api_key, base_url
         if emit_partial_update_hint(e):
             sys.exit(1)
         raise
+    if not toolsets:
+        cli._explicit_toolsets = False  # the gateway resolves the default and coding posture itself
+    # Only a typed -t is checked against a resumed session's frozen toolsets.
+    cli._typed_toolsets = toolsets_list if toolsets else None
 
     # skills.auto_load rides the same background preload as -s; --ignore-rules skips it with
     # the rest of the auto-injected context. Resolved here (not lazily in the agent) so the
@@ -1750,16 +1757,7 @@ def main(
     if _join_worktree is not None and not wt_info:
         return
 
-    # Inject worktree context into agent's system prompt
-    if wt_info:
-        wt_note = (
-            f"\n\n[System note: You are working in an isolated git worktree at "
-            f"{wt_info['path']}. Your branch is `{wt_info['branch']}`. "
-            f"Changes here do not affect the main working tree or other agents. "
-            f"Remember to commit and push your changes, and create a PR if appropriate. "
-            f"The original repo is at {wt_info['repo_root']}.]"
-        )
-        cli.system_prompt = (cli.system_prompt or "") + wt_note
+    # The worktree note is rendered by the gateway from the session's folder (agent/coding_context.py).
 
     if list_tools or list_toolsets:
         cli.show_banner()

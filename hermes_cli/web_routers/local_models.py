@@ -38,7 +38,7 @@ from hermes_cli.local_runtime import (
 from agent.memory_provider import spawn_context_thread
 from pm.downloader import Download, DownloadPaused, Source
 
-from hermes_cli.local_runtime.endpoint import _state_endpoint
+from hermes_cli.local_runtime.endpoint import _state_endpoint, child_query
 from hermes_cli.local_runtime.gguf import split_parts
 
 logger = logging.getLogger(__name__)
@@ -143,8 +143,8 @@ def _job(kind: str, target: str, model_id: str | None = None) -> dict[str, Any]:
     return job
 
 
-def _rate_and_eta(samples: "collections.deque[tuple[float, int]]", done: int,
-                  total: int | None) -> "tuple[float | None, int | None]":
+def _rate_and_eta(samples: collections.deque[tuple[float, int]], done: int,
+                  total: int | None) -> tuple[float | None, int | None]:
     """Transfer rate and remaining seconds from a trailing sample window.
 
     The rate is the slope across the window, not the last two ticks, so a
@@ -406,7 +406,7 @@ def _model_id_for(gguf: Path) -> str:
     return re.sub(_SPLIT_PART_RE + "$", "", gguf.stem)
 
 
-def _variant_files_on_disk(model_id: str) -> "list[Path]":
+def _variant_files_on_disk(model_id: str) -> list[Path]:
     """Every local file of a staged model: all split parts plus catalog-declared assets (mmproj/draft/MTP head) when present."""
     files = [p for p in bootstrap.models_dir().glob("*.gguf") if _model_id_for(p) == model_id]
     hit = catalog.find_entry_for_model(model_id)
@@ -446,7 +446,7 @@ def _download_job(job: dict[str, Any], plan) -> None:
     dl.run(progress=_download_progress_hook(job))
 
 
-def _loaded_models(running: dict[str, Any]) -> "tuple[dict[str, str], dict[str, Any]]":
+def _loaded_models(running: dict[str, Any]) -> tuple[dict[str, str], dict[str, Any]]:
     """Resident models right now, plus how each is placed (granted window from the child, spill facts from
     the preset decision) — the difference between 'fast' and 'why is my CPU busy', so it must be inspectable.
     'loading' is its own state (a 20-GB load in flight is the most important thing the pane can show)."""
@@ -461,7 +461,7 @@ def _loaded_models(running: dict[str, Any]) -> "tuple[dict[str, str], dict[str, 
         if plan is not None:
             facts.update(window=plan.window, window_label=_k_label(plan.window), spilled=plan.spilled)
         n_ctx = state in ("loaded", "ready") and _quiet(
-            lambda: _router_request(running, f"/props?model={model_id}", timeout=3)
+            lambda: _router_request(running, f"/props?{child_query(model_id)}", timeout=3)
             .get("default_generation_settings", {}).get("n_ctx"), None)
         if n_ctx:
             facts.update(granted_window=int(n_ctx), granted_window_label=_k_label(int(n_ctx)))
