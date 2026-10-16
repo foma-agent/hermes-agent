@@ -494,7 +494,10 @@ class AuthorityConnection:
             ref = resolve_titled_session(self.authority, self.actor, params['title'])
         else:
             from gateway.session_local_migration import resolve_local_target
+            from gateway.session_policy_refresh import refresh_settled
             from hermes_state_local_migration import LEGACY_LOCAL_SOURCES
+            # Another viewer's refresh mid-cleanup has committed a policy it has not published yet.
+            await refresh_settled(self.authority, ref.session_id)
             row = self.authority.db.get_session(ref.session_id)
             if row and row['source'] in LEGACY_LOCAL_SOURCES:
                 ref = resolve_local_target(self.authority, self.actor,
@@ -512,6 +515,11 @@ class AuthorityConnection:
         # reopens it (``reopen_local_session`` in the drain), so opening a finished chat
         # never re-lights DB-derived liveness with no new activity.
         self.authority.authorize(self.actor, ref, 'session:read')
+        if 'session:control' in self.actor.capabilities and ref.session_id not in self.subscriptions:
+            # A client attaching (main's `hermes -c` was a new process) re-reads the config-derived settings
+            # (CFG-2); a snapshot poll on this attachment does not.
+            from gateway.session_policy_refresh import refresh_resumed_policy
+            await refresh_resumed_policy(self.authority, ref)
         snapshot = await self.authority.attach(self.actor, ref)
         self.subscriptions[ref.session_id] = snapshot.subscription_id
         self._spawn_notice(ref)
