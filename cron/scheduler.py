@@ -268,6 +268,11 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     text = (error or "unknown error").strip()
     lower = text.lower()
 
+    # The monitor gate preserves execution-stage provenance in the persisted string error contract.
+    # Its own HTTP/auth diagnostics must bypass model-provider classification, but still use the
+    # bounded generic-error cleanup below.
+    monitor_source_failure = lower.startswith("monitor source failed:")
+
     # Script runner contract ("Script timed out after {n}s: {path}") — also for agent jobs with a
     # context script. Must precede provider classification so it never claims a model failure.
     # See #78503, #82460.
@@ -284,7 +289,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # no_agent jobs never reach a model, so provider errors are structurally impossible for them:
     # gate on job MODE before classifying, or a script's own wording ("429", "timed out") would
     # blame the wrong subsystem.
-    if not job.get("no_agent"):
+    if not job.get("no_agent") and not monitor_source_failure:
         notice = provider_failure_notice(
             job_name, job_id, classify_cron_failure_reason(text),
             backup_provider_phrase=_fallback_chain_phrase(job), provider=job.get("provider"))
@@ -1599,7 +1604,8 @@ def _apply_monitor_gate(
             f"Time: {_mon_now}"
         )
         return (
-            False, f"{header}**Status:** monitor source failed\n\n{_mon.error}\n", _mon_alert, _mon.error,
+            False, f"{header}**Status:** monitor source failed\n\n{_mon.error}\n", _mon_alert,
+            f"Monitor source failed: {_mon.error}",
         ), extra_prompt, None
     if not _mon.changed:
         # Unchanged: silent no_change tick (ledger doc kept; SILENT_MARKER blocks delivery).

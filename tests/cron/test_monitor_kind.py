@@ -418,6 +418,31 @@ def test_monitor_script_failure_is_error_not_change(hermes_env, monkeypatch):
     assert get_job(job["id"])["monitor_state"]["last_output_hash"] == stored_hash
 
 
+def test_monitor_script_http_error_is_not_reported_as_model_auth_failure(
+    hermes_env, monkeypatch,
+):
+    from cron.scheduler import _summarize_cron_failure_for_delivery, run_job
+
+    job = _make_monitor_job(
+        hermes_env,
+        "echo 'gh: API rate limit exceeded for demo-user. (HTTP 403)' >&2\nexit 1\n",
+    )
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    success, _doc, _final, error = run_job(job)
+    assert success is False
+    assert error is not None
+    assert observed["agent_runs"] == 0
+
+    notice = _summarize_cron_failure_for_delivery(job, error)
+    assert "monitor source failed" in notice.lower()
+    assert "api rate limit exceeded" in notice.lower()
+    assert "ai model service" not in notice.lower()
+    assert "/login" not in notice
+    assert "--provider" not in notice
+
+
 # ---------------------------------------------------------------------------
 # cronjob tool: API-layer wiring
 # ---------------------------------------------------------------------------
