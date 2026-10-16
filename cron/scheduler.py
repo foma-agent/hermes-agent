@@ -271,12 +271,16 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # The monitor gate preserves execution-stage provenance in the persisted string error contract.
     # Its own HTTP/auth diagnostics must bypass model-provider classification, but still use the
     # bounded generic-error cleanup below.
-    monitor_source_failure = lower.startswith("monitor source failed:")
+    monitor_source_prefix = "monitor source failed:"
+    monitor_source_failure = lower.startswith(monitor_source_prefix)
+    source_error_lower = (
+        lower[len(monitor_source_prefix):].lstrip() if monitor_source_failure else lower
+    )
 
     # Script runner contract ("Script timed out after {n}s: {path}") — also for agent jobs with a
     # context script. Must precede provider classification so it never claims a model failure.
     # See #78503, #82460.
-    if lower.startswith("script timed out"):
+    if source_error_lower.startswith("script timed out"):
         return script_timeout_notice(job_name, job_id)
 
     # Scheduler inactivity watchdog ("idle for {n}s (limit {m}s)"): the job's OWN tool call went

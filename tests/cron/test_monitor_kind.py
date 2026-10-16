@@ -443,6 +443,27 @@ def test_monitor_script_http_error_is_not_reported_as_model_auth_failure(
     assert "--provider" not in notice
 
 
+def test_monitor_script_timeout_keeps_script_timeout_guidance(hermes_env, monkeypatch):
+    from cron.scheduler import _summarize_cron_failure_for_delivery, run_job
+
+    job = _make_monitor_job(hermes_env, "echo stable\n")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    monkeypatch.setattr(
+        "cron.monitor._run_monitor_source",
+        lambda _job: (False, "Script timed out after 300s: monitor.sh"),
+    )
+
+    success, _doc, _final, error = run_job(job)
+    assert success is False
+    assert error is not None
+    assert observed["agent_runs"] == 0
+
+    notice = _summarize_cron_failure_for_delivery(job, error)
+    assert "its script timed out" in notice
+    assert "No model was invoked" in notice
+
+
 # ---------------------------------------------------------------------------
 # cronjob tool: API-layer wiring
 # ---------------------------------------------------------------------------
