@@ -20,6 +20,7 @@ on:
           - docker
           - profile-scratch
           - scratch-dir
+          - approval-policy
 
 permissions:
   contents: read
@@ -140,6 +141,29 @@ jobs:
         run: >-
           uv run --no-sync python -m pytest
           tests/test_scratch_dir.py
+          -v --tb=short
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      - name: Run the approval policy files on native Windows
+        if: inputs.suite == 'approval-policy'
+        run: >-
+          uv run --no-sync python -m pytest
+          tests/gateway/test_approvals_command.py
+          tests/hermes_cli/test_approvals_command.py
+          tests/hermes_cli/test_config.py
+          tests/hermes_cli/test_config_set_coercion.py
+          tests/hermes_cli/test_config_set_list_values.py
+          tests/hermes_cli/test_console_engine_config_guard.py
+          tests/hermes_cli/test_set_config_value.py
+          tests/tools/test_approval.py
+          tests/tools/test_approval_config_set_policy.py
+          tests/tools/test_approval_detection_policy_gate.py
+          tests/tui_gateway/test_approvals_policy_chokepoint.py
+          tests/tui_gateway/test_config_set_policy_write.py
+          tests/tui_gateway/test_tui_gateway_server.py
           -v --tb=short
         env:
           OPENROUTER_API_KEY: ""
