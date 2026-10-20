@@ -12,7 +12,7 @@ permissions: {}
 
 jobs:
   probe:
-    runs-on: macos-14
+    runs-on: macos-15-intel
     permissions:
       contents: read
     defaults:
@@ -24,6 +24,14 @@ jobs:
       - name: Validate evidence SHA
         run: |
           [[ "$EVIDENCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Record runner identity
+        run: |
+          architecture=$(uname -m)
+          version=$(sw_vers -productVersion)
+          printf 'runner_architecture=%s\nmacos_version=%s\n' "$architecture" "$version"
+          [[ "$architecture" == x86_64 ]]
+          [[ "$version" == 15.* ]]
 
       - name: Attached -e argument
         id: probe_attached_e
