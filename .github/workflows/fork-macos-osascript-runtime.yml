@@ -1,0 +1,179 @@
+name: Fork macOS osascript runtime evidence
+
+'on':
+  workflow_dispatch:
+    inputs:
+      evidence_sha:
+        description: Evidence commit SHA (metadata only; never executed)
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      EVIDENCE_SHA: ${{ inputs.evidence_sha }}
+    steps:
+      - name: Validate evidence SHA
+        run: |
+          [[ "$EVIDENCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: Attached -e argument
+        id: probe_attached_e
+        continue-on-error: true
+        run: |
+          result=$(osascript -e'return "ATTACHED_E_OK"')
+          [[ "$result" == 'ATTACHED_E_OK' ]]
+
+      - name: Explicit stdin path
+        id: probe_dev_stdin
+        continue-on-error: true
+        run: |
+          result=$(printf '%s\n' 'return "DEV_STDIN_OK"' | osascript /dev/stdin)
+          [[ "$result" == 'DEV_STDIN_OK' ]]
+
+      - name: AppleScript var identifier
+        id: probe_applescript_var
+        continue-on-error: true
+        run: |
+          result=$(osascript -e 'set var to "APPLESCRIPT_VAR_OK"' -e 'return var')
+          [[ "$result" == 'APPLESCRIPT_VAR_OK' ]]
+
+      - name: AppleScript let identifier
+        id: probe_applescript_let
+        continue-on-error: true
+        run: |
+          result=$(osascript -e 'set let to "APPLESCRIPT_LET_OK"' -e 'return let')
+          [[ "$result" == 'APPLESCRIPT_LET_OK' ]]
+
+      - name: AppleScript const identifier
+        id: probe_applescript_const
+        continue-on-error: true
+        run: |
+          result=$(osascript -e 'set const to "APPLESCRIPT_CONST_OK"' -e 'return const')
+          [[ "$result" == 'APPLESCRIPT_CONST_OK' ]]
+
+      - name: AppleScript string tokens
+        id: probe_string_tokens
+        continue-on-error: true
+        run: |
+          result=$(osascript -e 'if "a -- b" is equal to ("a " & "-- b") and "let it be" is equal to ("let " & "it be") then return "STRING_TOKENS_OK"')
+          [[ "$result" == 'STRING_TOKENS_OK' ]]
+
+      - name: JXA multiline close options
+        id: probe_jxa_multiline
+        continue-on-error: true
+        run: |
+          result=$(osascript -l JavaScript <<'JXA'
+          const local = {close: function (options) { return options.marker; }};
+          local.close({
+            marker: "JXA_MULTILINE_OK"
+          });
+          JXA
+          )
+          [[ "$result" == 'JXA_MULTILINE_OK' ]]
+
+      - name: JXA variable options
+        id: probe_jxa_variable
+        continue-on-error: true
+        run: |
+          result=$(osascript -l JavaScript <<'JXA'
+          const local = {close: function (options) { return options.marker; }};
+          const options = {marker: "JXA_VARIABLE_OK"};
+          local.close(options);
+          JXA
+          )
+          [[ "$result" == 'JXA_VARIABLE_OK' ]]
+
+      - name: Printf decoded newlines
+        id: probe_printf_newlines
+        continue-on-error: true
+        run: |
+          result=$(printf 'set marker to "PRINTF_NEWLINES_OK"\nreturn marker\n' | osascript)
+          [[ "$result" == 'PRINTF_NEWLINES_OK' ]]
+
+      - name: Bash ANSI-C multiline argument
+        id: probe_ansi_c
+        continue-on-error: true
+        run: |
+          result=$(osascript -e $'set marker to "ANSI_C_OK"\nreturn marker')
+          [[ "$result" == 'ANSI_C_OK' ]]
+
+      - name: Attached here-string
+        id: probe_here_string
+        continue-on-error: true
+        run: |
+          result=$(osascript<<<'return "HERE_STRING_OK"')
+          [[ "$result" == 'HERE_STRING_OK' ]]
+
+      - name: Heredoc delimiter with space
+        id: probe_heredoc_space
+        continue-on-error: true
+        run: |
+          result=$(osascript <<'END SCRIPT'
+          return "HEREDOC_SPACE_OK"
+          END SCRIPT
+          )
+          [[ "$result" == 'HEREDOC_SPACE_OK' ]]
+
+      - name: Heredoc punctuation delimiter
+        id: probe_heredoc_punctuation
+        continue-on-error: true
+        run: |
+          result=$(osascript <<'+++'
+          return "HEREDOC_PUNCTUATION_OK"
+          +++
+          )
+          [[ "$result" == 'HEREDOC_PUNCTUATION_OK' ]]
+
+      - name: Vertical tab inside comment
+        id: probe_vertical_tab
+        continue-on-error: true
+        run: |
+          result=$(printf '%b' '-- harmless\v comment\nreturn "VERTICAL_TAB_OK"\n' | osascript)
+          [[ "$result" == 'VERTICAL_TAB_OK' ]]
+
+      - name: Python subprocess carrier
+        id: probe_python_carrier
+        continue-on-error: true
+        run: |
+          result=$(python3 -c 'import subprocess; result = subprocess.run(["osascript", "-e", "return \"PYTHON_CARRIER_OK\""], check=True, capture_output=True, text=True); assert result.stdout.strip() == "PYTHON_CARRIER_OK"; print(result.stdout.strip())')
+          [[ "$result" == 'PYTHON_CARRIER_OK' ]]
+
+      - name: Require every runtime probe
+        if: ${{ always() }}
+        env:
+          PROBE_OUTCOMES: |
+            probe_attached_e=${{ steps.probe_attached_e.outcome }}
+            probe_dev_stdin=${{ steps.probe_dev_stdin.outcome }}
+            probe_applescript_var=${{ steps.probe_applescript_var.outcome }}
+            probe_applescript_let=${{ steps.probe_applescript_let.outcome }}
+            probe_applescript_const=${{ steps.probe_applescript_const.outcome }}
+            probe_string_tokens=${{ steps.probe_string_tokens.outcome }}
+            probe_jxa_multiline=${{ steps.probe_jxa_multiline.outcome }}
+            probe_jxa_variable=${{ steps.probe_jxa_variable.outcome }}
+            probe_printf_newlines=${{ steps.probe_printf_newlines.outcome }}
+            probe_ansi_c=${{ steps.probe_ansi_c.outcome }}
+            probe_here_string=${{ steps.probe_here_string.outcome }}
+            probe_heredoc_space=${{ steps.probe_heredoc_space.outcome }}
+            probe_heredoc_punctuation=${{ steps.probe_heredoc_punctuation.outcome }}
+            probe_vertical_tab=${{ steps.probe_vertical_tab.outcome }}
+            probe_python_carrier=${{ steps.probe_python_carrier.outcome }}
+        run: |
+          printf 'evidence_sha=%s\n' "$EVIDENCE_SHA"
+          failed=0
+          count=0
+          while IFS='=' read -r probe outcome; do
+            printf '%s=%s\n' "$probe" "$outcome"
+            count=$((count + 1))
+            [[ "$outcome" == success ]] || failed=1
+          done <<< "$PROBE_OUTCOMES"
+          [[ "$EVIDENCE_SHA" =~ ^[0-9a-f]{40}$ ]] || failed=1
+          [[ "$count" -eq 15 && "$failed" -eq 0 ]]
