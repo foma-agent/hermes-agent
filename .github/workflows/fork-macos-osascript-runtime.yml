@@ -167,6 +167,7 @@ jobs:
             probe_vertical_tab=${{ steps.probe_vertical_tab.outcome }}
             probe_python_carrier=${{ steps.probe_python_carrier.outcome }}
         run: |
+          [[ "$EVIDENCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           printf 'evidence_sha=%s\n' "$EVIDENCE_SHA"
           failed=0
           count=0
@@ -175,5 +176,4 @@ jobs:
             count=$((count + 1))
             [[ "$outcome" == success ]] || failed=1
           done <<< "$PROBE_OUTCOMES"
-          [[ "$EVIDENCE_SHA" =~ ^[0-9a-f]{40}$ ]] || failed=1
           [[ "$count" -eq 15 && "$failed" -eq 0 ]]
