@@ -150,7 +150,7 @@ jobs:
       - name: Require every runtime probe
         if: ${{ always() }}
         env:
-          PROBE_OUTCOMES: |
+          PROBE_OUTCOMES: |-
             probe_attached_e=${{ steps.probe_attached_e.outcome }}
             probe_dev_stdin=${{ steps.probe_dev_stdin.outcome }}
             probe_applescript_var=${{ steps.probe_applescript_var.outcome }}
