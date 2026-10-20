@@ -36,14 +36,17 @@ jobs:
         id: probe_dev_stdin
         continue-on-error: true
         run: |
+          stdout_file=$(mktemp)
           stderr_file=$(mktemp)
-          trap 'rm -f "$stderr_file"' EXIT
-          if result=$(printf '%s\n' 'return "DEV_STDIN_OK"' | osascript /dev/stdin 2>"$stderr_file"); then
-            printf 'osascript unexpectedly executed /dev/stdin: %s\n' "$result"
-            exit 1
-          fi
-          [[ -z "$result" ]]
-          grep -F 'I/O error' "$stderr_file"
+          trap 'rm -f "$stdout_file" "$stderr_file"' EXIT
+          set +e
+          printf '%s\n' 'return "DEV_STDIN_OK"' | osascript /dev/stdin >"$stdout_file" 2>"$stderr_file"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          cat "$stderr_file" >&2
+          [[ "${pipeline_status[1]}" -ne 0 ]]
+          [[ ! -s "$stdout_file" ]]
+          grep -F 'osascript: /dev/stdin: I/O error' "$stderr_file"
           printf 'DEV_STDIN_REJECTED\n'
 
       - name: AppleScript var identifier
