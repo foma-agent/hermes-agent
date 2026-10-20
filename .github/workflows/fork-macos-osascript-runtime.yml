@@ -32,12 +32,19 @@ jobs:
           result=$(osascript -e'return "ATTACHED_E_OK"')
           [[ "$result" == 'ATTACHED_E_OK' ]]
 
-      - name: Explicit stdin path
+      - name: Explicit stdin path is rejected
         id: probe_dev_stdin
         continue-on-error: true
         run: |
-          result=$(printf '%s\n' 'return "DEV_STDIN_OK"' | osascript /dev/stdin)
-          [[ "$result" == 'DEV_STDIN_OK' ]]
+          stderr_file=$(mktemp)
+          trap 'rm -f "$stderr_file"' EXIT
+          if result=$(printf '%s\n' 'return "DEV_STDIN_OK"' | osascript /dev/stdin 2>"$stderr_file"); then
+            printf 'osascript unexpectedly executed /dev/stdin: %s\n' "$result"
+            exit 1
+          fi
+          [[ -z "$result" ]]
+          grep -F 'I/O error' "$stderr_file"
+          printf 'DEV_STDIN_REJECTED\n'
 
       - name: AppleScript var identifier
         id: probe_applescript_var
