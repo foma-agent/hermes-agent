@@ -110,6 +110,48 @@ jobs:
           )
           [[ "$result" == 'JXA_VARIABLE_OK' ]]
 
+      - name: JXA prefix decrement leaves following code live
+        id: probe_jxa_prefix_decrement
+        continue-on-error: true
+        run: |
+          result=$(osascript -l JavaScript <<'JXA'
+          var i = 3;
+          var j = --i;
+          var local = {close: function (options) { return options.marker + ':' + i + ':' + j; }};
+          local.close({marker: "JXA_PREFIX_DECREMENT_OK"});
+          JXA
+          )
+          [[ "$result" == 'JXA_PREFIX_DECREMENT_OK:2:2' ]]
+
+      - name: AppleScript possessive leaves block marker in string data
+        id: probe_applescript_possessive
+        continue-on-error: true
+        run: |
+          result=$(osascript <<'APPLESCRIPT'
+          script LocalDocument
+            property name : "Deck"
+          end script
+          set n to LocalDocument's name & "'s (*"
+          return n & "|APPLESCRIPT_POSSESSIVE_OK"
+          APPLESCRIPT
+          )
+          [[ "$result" == "Deck's (*|APPLESCRIPT_POSSESSIVE_OK" ]]
+
+      - name: macOS sh echo decodes backslash newline
+        id: probe_sh_echo
+        continue-on-error: true
+        run: |
+          bytes=$(/bin/sh -c "echo 'A\\nB'" | od -An -tx1 | tr -d ' \n')
+          printf 'sh_echo_hex=%s\n' "$bytes"
+          [[ "$bytes" == '410a420a' ]]
+
+      - name: AppleScript raw no constant parses
+        id: probe_raw_no_constant
+        continue-on-error: true
+        run: |
+          result=$(osascript -e 'return «constant ****no  » is «constant ****no  »')
+          [[ "$result" == 'true' ]]
+
       - name: Printf decoded newlines
         id: probe_printf_newlines
         continue-on-error: true
@@ -177,6 +219,10 @@ jobs:
             probe_string_tokens=${{ steps.probe_string_tokens.outcome }}
             probe_jxa_multiline=${{ steps.probe_jxa_multiline.outcome }}
             probe_jxa_variable=${{ steps.probe_jxa_variable.outcome }}
+            probe_jxa_prefix_decrement=${{ steps.probe_jxa_prefix_decrement.outcome }}
+            probe_applescript_possessive=${{ steps.probe_applescript_possessive.outcome }}
+            probe_sh_echo=${{ steps.probe_sh_echo.outcome }}
+            probe_raw_no_constant=${{ steps.probe_raw_no_constant.outcome }}
             probe_printf_newlines=${{ steps.probe_printf_newlines.outcome }}
             probe_ansi_c=${{ steps.probe_ansi_c.outcome }}
             probe_here_string=${{ steps.probe_here_string.outcome }}
@@ -194,4 +240,4 @@ jobs:
             count=$((count + 1))
             [[ "$outcome" == success ]] || failed=1
           done <<< "$PROBE_OUTCOMES"
-          [[ "$count" -eq 15 && "$failed" -eq 0 ]]
+          [[ "$count" -eq 19 && "$failed" -eq 0 ]]
