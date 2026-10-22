@@ -127,14 +127,12 @@ jobs:
         id: probe_applescript_possessive
         continue-on-error: true
         run: |
-          result=$(osascript <<'APPLESCRIPT'
-          script LocalDocument
-            property name : "Deck"
-          end script
-          set n to LocalDocument's name & "'s (*"
-          return n & "|APPLESCRIPT_POSSESSIVE_OK"
-          APPLESCRIPT
-          )
+          result=$(osascript \
+            -e 'script LocalDocument' \
+            -e 'property name : "Deck"' \
+            -e 'end script' \
+            -e "set n to LocalDocument's name & \"'s (*\"" \
+            -e 'return n & "|APPLESCRIPT_POSSESSIVE_OK"')
           [[ "$result" == "Deck's (*|APPLESCRIPT_POSSESSIVE_OK" ]]
 
       - name: macOS sh echo decodes backslash newline
