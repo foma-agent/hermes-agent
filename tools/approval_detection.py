@@ -28,6 +28,7 @@ _HERMES_ENV_PATH = (
 _HERMES_CONFIG_PATH = (
     r'(?:~\/\.hermes/|(?:\$home|\$\{home\})/\.hermes/|(?:\$hermes_home|\$\{hermes_home\})/)' r'config\.yaml\b'
 )
+_SECURITY_CONFIG_APPROVAL_KEY = "modify Hermes security policy via config"
 _PROJECT_ENV_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*\.env(?:\.[^/\s"\'`]+)*)'
 _PROJECT_CONFIG_PATH = r'(?:(?:/|\.{1,2}/)?(?:[^\s/"\'`]+/)*config\.yaml)'
 _SHELL_RC_FILES = r'(?:~|\$home|\$\{home\})/\.' r'(?:bashrc|zshrc|profile|bash_profile|zprofile)\b'
@@ -844,7 +845,11 @@ _PARAM_DEFAULT_RE = re.compile(r"\$\{[^}:}\s]+:-(?P<default>[^}]*)\}")
 _SIMPLE_SHELL_LITERAL_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _COMMAND_WRAPPER_WORDS = {"sudo", "env", "exec", "nohup", "setsid", "time", "command", "builtin",
-                          "nice", "timeout", "stdbuf", "ionice", "chrt", "taskset", "chroot"}
+                          "nice", "timeout", "stdbuf", "ionice", "chrt", "taskset", "chroot", "xargs",
+                          "uv", "poetry", "pipx"}
+# These package runners execute argv only through their ``run`` subcommand. Treating every
+# subcommand as a wrapper would turn data following e.g. ``uv sync`` into an executable.
+_COMMAND_WRAPPER_REQUIRED_POSITIONAL = {"uv": "run", "poetry": "run", "pipx": "run"}
 _SUDO_OPTIONS_WITH_ARG = {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-u", "--user"}
 # Adapted from embwl0x's command-position work in #76063. Option operands are
 # data, not executable positions; option spelling remains case-sensitive.
@@ -857,11 +862,24 @@ _COMMAND_WRAPPER_OPTIONS_WITH_ARG = {
     "timeout": {"-k", "--kill-after", "-s", "--signal"},
     "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
     "ionice": {"-c", "--class", "-n", "--classdata"},
+    "xargs": {"-a", "--arg-file", "-d", "--delimiter", "-E", "-I", "-J", "-L", "-n",
+              "--max-args", "-P", "--max-procs", "-R", "-S", "-s", "--max-chars",
+              "--process-slot-var"},
+    "uv": {"--directory", "--project", "--config-file", "--python", "--with", "--with-editable",
+           "--with-requirements", "--env-file", "--package"},
+    "poetry": {"-C", "--directory", "-P", "--project"},
+    "pipx": {"--index-url", "--pip-args", "--python", "--spec", "--suffix"},
 }
 _COMMAND_WRAPPER_NON_EXECUTING_OPTIONS = {
     "command": {"-v", "-V"}, "chrt": {"-p", "--pid"},
     "ionice": {"-p", "--pid", "--pgid", "--uid"}, "taskset": {"-p", "--pid"},
 }
+_XARGS_SHORT_OPTIONS_WITH_ARG = frozenset(
+    option[1]
+    for option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG["xargs"]
+    if option.startswith("-") and not option.startswith("--") and len(option) == 2
+)
+_XARGS_SHORT_OPTIONS_WITH_OPTIONAL_ARG = frozenset("eil")
 _COMMAND_WRAPPER_POSITIONAL_ARGS = {"chroot": 1, "chrt": 1, "taskset": 1, "timeout": 1}
 _SHELL_COMMAND_TRANSITIONS = {"if", "then", "else", "elif", "do", "while", "until", "!"}
 _SHELL_REDIRECTION_RE = re.compile(r"(?:[0-9]+)?(?:>>|<<|<>|>&|<&|>\||[<>])")
@@ -1485,10 +1503,32 @@ def _mask_quoted_newlines_span(command: str, start: int, end: int) -> str:
     return "".join(out)
 
 
+def _wrapper_option_consumes_next_arg(wrapper: str, token: str) -> bool:
+    """Whether a wrapper option owns the following argv word."""
+    option = token.split("=", 1)[0]
+    if "=" in token:
+        return False
+    if option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG.get(wrapper, set()):
+        return True
+    if wrapper != "xargs" or option.startswith("--"):
+        return False
+    # GNU/BSD xargs accept clustered short options. The first option with an
+    # argument owns the rest of its token; only a required owner at the end
+    # consumes the next word. Deprecated -e/-i/-l take optional attached-only
+    # arguments, so they stop the cluster without swallowing the command.
+    chars = option[1:]
+    for index, char in enumerate(chars):
+        if char in _XARGS_SHORT_OPTIONS_WITH_OPTIONAL_ARG:
+            return False
+        if char in _XARGS_SHORT_OPTIONS_WITH_ARG:
+            return index == len(chars) - 1
+    return False
+
+
 def _iter_shell_command_word_spans(command: str):
     """Yield command-position words that may be executable names."""
     for pos in _iter_shell_command_starts(command):
-        wrapper, positionals = None, 0
+        wrapper, positionals, required_positional = None, 0, None
         options, skip_arg = True, False
         while pos < len(command):
             redirect = _SHELL_REDIRECTION_RE.match(command, _skip_shell_whitespace(command, pos))
@@ -1517,9 +1557,12 @@ def _iter_shell_command_word_spans(command: str):
                 if option in queries or (wrapper == "command" and not option.startswith("--")
                                          and set(option[1:]) & {"v", "V"}):
                     break
-                skip_arg = "=" not in deobfuscated and option in _COMMAND_WRAPPER_OPTIONS_WITH_ARG.get(wrapper, set())
+                skip_arg = _wrapper_option_consumes_next_arg(wrapper, deobfuscated)
                 continue
             if positionals:
+                if required_positional is not None and deobfuscated != required_positional:
+                    break
+                required_positional = None
                 positionals -= 1
                 continue
             if _ENV_ASSIGNMENT_RE.fullmatch(word):
@@ -1528,7 +1571,8 @@ def _iter_shell_command_word_spans(command: str):
             if name not in _COMMAND_WRAPPER_WORDS:
                 break
             wrapper, options = name, True
-            positionals = _COMMAND_WRAPPER_POSITIONAL_ARGS.get(name, 0)
+            required_positional = _COMMAND_WRAPPER_REQUIRED_POSITIONAL.get(name)
+            positionals = max(_COMMAND_WRAPPER_POSITIONAL_ARGS.get(name, 0), int(required_positional is not None))
 
 
 def _shell_command_segment(command: str, start: int) -> str:
@@ -1682,11 +1726,16 @@ def _command_detection_variants(command: str):
         return True
 
     # Windows-path variant: normalization strips backslashes as shell escapes, so `del C:\Users\me\.ssh\id_rsa`
-    # reaches the patterns as `del C:Usersme.sshid_rsa`. When the RAW command has a drive-letter or UNC backslash
-    # path, also yield a variant with backslashes flattened to `/` BEFORE normalization. Gated on a real path shape so
-    # POSIX escape semantics (`echo a\"b`) are untouched elsewhere.
+    # reaches the patterns as `del C:Usersme.sshid_rsa`. When the RAW command has a drive-letter, UNC, or
+    # dot-relative backslash path, also yield a variant with backslashes flattened to `/` BEFORE normalization.
+    # Gated on a real path shape so POSIX escape semantics (`echo a\"b`) are untouched elsewhere.
     # See #69472.
-    if re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command) or re.search(r"[A-Za-z]:\\", command):
+    if (
+        re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command)
+        or re.search(r"[A-Za-z]:\\", command)
+        or ".\\" in command
+        or re.search(r"(?:^|[\s;&|()])(?:[^\\\s;&|()\"'`]+\\)+[^\\\s;&|()\"'`]+", command)
+    ):
         win_variant = _normalize_command_for_detection(_mask_quoted_newlines(command.replace("\\", "/")))
         if fresh(win_variant):
             yield win_variant
@@ -1879,6 +1928,14 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
     patterns = DANGEROUS_PATTERNS_COMPILED if only is None else [
         (pattern_re, description) for pattern_re, description in DANGEROUS_PATTERNS_COMPILED if description in only
     ]
+    from tools.approval_detection_policy import _is_hermes_security_config_mutation
+
+    # Policy mutations take precedence over co-flagged, persistable findings.
+    if only is None:
+        for command_variant in _command_detection_variants(command):
+            if _is_hermes_security_config_mutation(command_variant):
+                yield _SECURITY_CONFIG_APPROVAL_KEY
+                break
     for command_variant in _command_detection_variants(command):
         command_lower = _lower_preserving_flags(command_variant)
         masked_lower: str | None = None

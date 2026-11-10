@@ -29,8 +29,8 @@ from tools.approval_context import (
     get_current_session_key,
 )
 from tools.approval_detection import (
-    _approval_key_aliases, _check_sudo_stdin_guard, detect_content_rule_keys, detect_dangerous_command,
-    detect_hardline_command,
+    _SECURITY_CONFIG_APPROVAL_KEY, _approval_key_aliases, _check_sudo_stdin_guard,
+    detect_content_rule_keys, detect_dangerous_command, detect_hardline_command,
 )
 from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _matching_permanent_allowlist_entry, _match_user_deny_rule, _sudo_stdin_block_result,
@@ -60,6 +60,19 @@ _launch_yolo_applied: set[str] = set()
 _permanent_approved: set = set()
 # Routed multiplex profiles: one permanent allowlist per profile home (see ``_permanent_set``).
 _permanent_approved_by_home: dict[str, set] = {}
+
+
+def _is_policy_mutation_key(pattern_key: str) -> bool:
+    """Policy mutations are always approved one operation at a time."""
+    return _SECURITY_CONFIG_APPROVAL_KEY in _approval_key_aliases(pattern_key)
+
+
+def _command_allowlist_approves(command: str) -> bool:
+    """Honor command-prefix approvals except for security-policy mutations."""
+    if not _command_matches_permanent_allowlist(command):
+        return False
+    dangerous, pattern_key, _ = detect_dangerous_command(command)
+    return not (dangerous and _is_policy_mutation_key(pattern_key))
 
 # --- Consecutive-denial circuit breaker for smart approvals ---------------------------------------------------------
 # Each retry of a smart-denied command burns another guardian LLM call. After ``approvals.denial_breaker_threshold``
@@ -313,6 +326,8 @@ def submit_pending(session_key: str, approval: dict):
 
 def approve_session(session_key: str, pattern_key: str):
     """Approve a pattern for this session only."""
+    if _is_policy_mutation_key(pattern_key):
+        return
     with _lock:
         _session_approved.setdefault(session_key, set()).add(pattern_key)
 
@@ -417,7 +432,7 @@ def _sync_permanent_from_disk(approved: set, key: str) -> None:
     at restart. Only the on-disk delta is applied: approvals this process made but could not save
     survive. The config read is cached on the file signature. Callers hold ``_lock``."""
     try:
-        on_disk = _read_permanent_allowlist()
+        on_disk = {key for key in _read_permanent_allowlist() if not _is_policy_mutation_key(key)}
     except Exception as e:
         logger.warning("Failed to load permanent allowlist: %s", e, exc_info=True)
         return
@@ -435,6 +450,8 @@ def _approval_scope(session_key: str, pattern_key: str) -> str | None:
     Accepts the canonical key and the legacy regex-derived key so existing command_allowlist
     entries survive key migrations."""
     aliases = _approval_key_aliases(pattern_key)
+    if _SECURITY_CONFIG_APPROVAL_KEY in aliases:
+        return None
     with _lock:
         permanent = _permanent_set()
         session = _session_approved.get(session_key, set())
@@ -453,12 +470,16 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
 def _is_permanently_approved(pattern_key: str) -> bool:
     """Permanent approval only, with compatibility for migrated pattern keys."""
     aliases = _approval_key_aliases(pattern_key)
+    if _SECURITY_CONFIG_APPROVAL_KEY in aliases:
+        return False
     with _lock:
         return any(alias in _permanent_set() for alias in aliases)
 
 
 def approve_permanent(pattern_key: str):
     """Add a pattern to the permanent allowlist."""
+    if _is_policy_mutation_key(pattern_key):
+        return
     with _lock:
         _permanent_set().add(pattern_key)
 
@@ -468,13 +489,13 @@ def load_permanent(patterns: set):
     with _lock:
         governing = _permanent_set()
         governing.clear()
-        governing.update(patterns)
+        governing.update(pattern for pattern in patterns if not _is_policy_mutation_key(pattern))
 
 
 def _persist_choice(session_key: str, choice: str, keys: list[str]) -> None:
     """Persist a human ``session``/``always`` choice for each pattern key. ``once`` persists nothing."""
     for key in keys:
-        if choice not in ("session", "always"):
+        if choice not in ("session", "always") or _is_policy_mutation_key(key):
             continue
         approve_session(session_key, key)
         if choice == "always":
@@ -639,16 +660,17 @@ def _gateway_notify_cb(session_key: str):
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], body: str | None,
-                    smart_denied: bool) -> dict:
+                    smart_denied: bool, allow_session: bool, allow_permanent: bool) -> dict:
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
     ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
-    pending = {"command": command, "pattern_key": pattern_key}
+    pending: dict[str, object] = {"command": command, "pattern_key": pattern_key}
     if spec.pending_keys:
         pending["pattern_keys"] = pattern_keys
     pending["description"] = description
+    pending.update(allow_session=allow_session, allow_permanent=allow_permanent)
     if smart_denied:
-        pending.update(smart_denied=True, allow_permanent=False)
+        pending["smart_denied"] = True
     submit_pending(session_key, pending)
     if not spec.pending_keys:
         return {
@@ -668,8 +690,9 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
             "user's decision; if this turn must end, report that approval is pending."
         ),
     }
+    result.update(allow_session=allow_session, allow_permanent=allow_permanent)
     if smart_denied:
-        result.update(smart_denied=True, allow_permanent=False)
+        result["smart_denied"] = True
     return result
 
 
@@ -930,7 +953,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = not smart_denied
+    one_shot = any(_is_policy_mutation_key(key) for key in pattern_keys)
+    allow_session = not smart_denied and not one_shot
+    allow_permanent = allow_session
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -943,8 +968,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, noun=spec.noun, **extra)
 
     def grant(choice: str) -> dict:
-        # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
+        # Legacy scope choices cannot persist this operation or any co-flagged key.
+        if not smart_denied and not one_shot:
             _persist_choice(session_key, choice, pattern_keys)
         if spec.user_approved:
             return _user_approved(session_key, description)
@@ -953,7 +978,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     if spec.transport:
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
-            session_key=session_key, allow_session=not smart_denied, allow_permanent=allow_permanent,
+            session_key=session_key, allow_session=allow_session, allow_permanent=allow_permanent,
             surface=approval_context.gateway_approval_surface() if (is_gateway or is_ask) else "cli",
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
@@ -979,8 +1004,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
             }
             if smart_denied:
                 data["smart_denied"] = True
@@ -1019,6 +1044,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             return _pending_result(
                 spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
                 pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                allow_session=allow_session, allow_permanent=allow_permanent,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -1029,8 +1055,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
-    choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        prompt_command, prompt_description, allow_permanent=allow_permanent,
+        allow_session=allow_session, smart_denied=smart_denied, approval_callback=approval_callback,
+    )
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -1225,7 +1253,7 @@ def check_dangerous_command(command: str, env_type: str,
         return blocked
     if _yolo_active() or approval_context._get_approval_mode() == "off":
         return _approved()
-    if _command_matches_permanent_allowlist(command):
+    if _command_allowlist_approves(command):
         return _allowlisted(command)
     session_key = get_current_session_key()
     findings = _command_findings(command)
@@ -1294,7 +1322,7 @@ def check_all_command_guards(command: str, env_type: str,
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
         return _approved()
-    if _command_matches_permanent_allowlist(command):
+    if _command_allowlist_approves(command):
         return _allowlisted(command)
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
