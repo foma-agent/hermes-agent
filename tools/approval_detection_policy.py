@@ -19,6 +19,9 @@ def _security_config_argv_mutation(argv: list[str]) -> bool:
     for index, token in enumerate(without_profiles):
         if token != "config" or index + 1 >= len(without_profiles):
             continue
+        # The editor can replace any policy namespace, regardless of its initial contents.
+        if without_profiles[index + 1] == "edit":
+            return True
         if without_profiles[index + 1] not in {"set", "unset"}:
             continue
         key_index = index + 2
