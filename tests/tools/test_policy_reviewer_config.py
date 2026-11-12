@@ -11,6 +11,7 @@ from tools import approval, terminal_tool as terminal
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("wrapper", ["plain", "env_split"])
 @pytest.mark.parametrize("arguments", [
     "set auxiliary.approval.model replacement",
     "set auxiliary.approval.provider custom",
@@ -20,7 +21,7 @@ from tools import approval, terminal_tool as terminal
     "unset auxiliary.approval",
     "unset auxiliary",
 ])
-def test_reviewer_mutation_is_refused_before_terminal_effect(tmp_path, monkeypatch, arguments):
+def test_reviewer_mutation_is_refused_before_terminal_effect(tmp_path, monkeypatch, arguments, wrapper):
     home = tmp_path / "home"
     home.mkdir()
     config = home / "config.yaml"
@@ -42,6 +43,8 @@ def test_reviewer_mutation_is_refused_before_terminal_effect(tmp_path, monkeypat
 
     launcher = Path(__file__).resolve().parents[2] / "hermes"
     command = f"{shlex.quote(sys.executable)} {shlex.quote(str(launcher))} config {arguments}"
+    if wrapper == "env_split":
+        command = f"env -S {shlex.quote(command)}"
     terminal.set_approval_callback(deny)
     try:
         result = json.loads(terminal.terminal_tool(command, timeout=30, workdir=str(tmp_path)))
@@ -59,3 +62,29 @@ def test_reviewer_mutation_is_refused_before_terminal_effect(tmp_path, monkeypat
 ])
 def test_unrelated_auxiliary_settings_remain_ordinary(command):
     assert approval.detect_dangerous_command(command) == (False, None, None)
+
+
+@pytest.mark.parametrize("command", [
+    "env -S 'hermes config set approvals.mode off'",
+    "env -S'hermes config set approvals.mode' off",
+    "env --split-string 'hermes config set' approvals.mode off",
+    "env --split-string='hermes config' set approvals.mode off",
+    "env -i -u UNUSED -C /tmp -S 'hermes config set approvals.mode off'",
+    "env --unset=UNUSED --chdir=/tmp --split-string='hermes config set' approvals.mode off",
+])
+def test_literal_env_split_policy_mutation(command):
+    from tools.approval_detection_policy import _is_hermes_security_config_mutation
+
+    assert _is_hermes_security_config_mutation(command)
+
+
+@pytest.mark.parametrize("command", [
+    "env -S 'echo hermes config set approvals.mode off'",
+    "env -S 'echo' 'hermes config set approvals.mode off'",
+    "env -S 'echo ; hermes config set approvals.mode off'",
+    "env -S '${COMMAND} config set approvals.mode off'",
+])
+def test_literal_env_split_preserves_data_and_unresolved_expansion(command):
+    from tools.approval_detection_policy import _is_hermes_security_config_mutation
+
+    assert not _is_hermes_security_config_mutation(command)

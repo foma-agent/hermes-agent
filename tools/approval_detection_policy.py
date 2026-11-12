@@ -121,7 +121,8 @@ def _security_config_runner_payload_start(tokens: list[str]) -> int | None:
 def _is_hermes_security_config_mutation(command: str) -> bool:
     """Parse command-position argv so shell quoting cannot hide a config mutation."""
     from tools.approval_detection import (
-        _iter_shell_command_word_spans, _shell_command_segment, _shell_segment_tokens,
+        _env_split_payload, _iter_shell_command_word_spans,
+        _shell_command_segment, _shell_segment_tokens,
     )
 
     pending, seen = [command], set()
@@ -136,6 +137,12 @@ def _is_hermes_security_config_mutation(command: str) -> bool:
                 continue
             if _security_config_entrypoint_mutation(tokens):
                 return True
+            if os.path.basename(tokens[0]).lower() == "env":
+                # Reuse the bounded literal env grammar and quote argv on projection:
+                # split-string data is not shell code, and the suffix stays argv.
+                payload = _env_split_payload(tokens)
+                if payload:
+                    pending.append(payload)
             payload_start = _security_config_runner_payload_start(tokens)
             if payload_start is not None and any(
                 _security_config_entrypoint_mutation(tokens[index:])
