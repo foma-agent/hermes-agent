@@ -27,9 +27,10 @@ def _security_config_argv_mutation(argv: list[str]) -> bool:
         if key_index >= len(without_profiles):
             continue
         key = without_profiles[key_index]
-        if key == "yolo" or any(
+        # Replacing/removing the parent also changes the smart reviewer's authority.
+        if key in {"yolo", "auxiliary"} or any(
             key == namespace or key.startswith(namespace + ".")
-            for namespace in ("approvals", "security", "command_allowlist")
+            for namespace in ("approvals", "security", "command_allowlist", "auxiliary.approval")
         ):
             return True
     return False
