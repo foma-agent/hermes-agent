@@ -17,6 +17,9 @@ def _security_config_argv_mutation(argv: list[str]) -> bool:
         index += 1
 
     for index, token in enumerate(without_profiles):
+        # Disabling any plugin can remove a native guard; never load it to inspect it.
+        if token == "plugins" and without_profiles[index + 1:index + 2] == ["disable"]:
+            return True
         if token != "config" or index + 1 >= len(without_profiles):
             continue
         # The editor can replace any policy namespace, regardless of its initial contents.
@@ -33,7 +36,7 @@ def _security_config_argv_mutation(argv: list[str]) -> bool:
         # Replacing/removing the parent also changes the smart reviewer's authority.
         if key in {"yolo", "auxiliary"} or any(
             key == namespace or key.startswith(namespace + ".")
-            for namespace in ("approvals", "security", "command_allowlist", "auxiliary.approval")
+            for namespace in ("approvals", "security", "command_allowlist", "auxiliary.approval", "plugins")
         ):
             return True
     return False
