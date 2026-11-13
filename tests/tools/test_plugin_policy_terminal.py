@@ -21,6 +21,10 @@ def policy_profile(tmp_path, monkeypatch):
         "approvals:\n  mode: manual\n"
         "plugins:\n  enabled: [opaque]\n  disabled: []\n"
     )
+    plugin = home / "plugins" / "opaque"
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text("name: opaque\nversion: '1.0'\n")
+    (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_KEY", uuid.uuid4().hex)
     monkeypatch.setenv("TERMINAL_ENV", "local")
@@ -37,6 +41,7 @@ def _run_cli(arguments, workdir):
 @pytest.mark.platforms("posix")
 @pytest.mark.parametrize("arguments", [
     "plugins disable opaque",
+    "plugins remove opaque",
     "config set plugins.enabled '[]'",
     "config set plugins.disabled '[opaque]'",
     "config set --force plugins '{\"enabled\": [], \"disabled\": [\"opaque\"]}'",
@@ -46,17 +51,29 @@ def _run_cli(arguments, workdir):
 ])
 def test_plugin_policy_is_denied_before_cli_execution(tmp_path, policy_profile, arguments):
     before = policy_profile.read_bytes()
+    plugin = policy_profile.parent / "plugins" / "opaque"
+    plugin_files = {
+        name: (plugin / name).read_bytes() for name in ("plugin.yaml", "__init__.py")
+    }
     calls = []
+
+    def assert_preserved():
+        assert policy_profile.read_bytes() == before
+        assert plugin.is_dir()
+        assert {name: (plugin / name).read_bytes() for name in plugin_files} == plugin_files
 
     def deny(*args, **kwargs):
         calls.append((args, kwargs))
+        assert_preserved()
+        assert kwargs["allow_session"] is False
+        assert kwargs["allow_permanent"] is False
         return "deny"
 
     terminal.set_approval_callback(deny)
     try:
         result = _run_cli(arguments, tmp_path)
         assert result.get("status") == "blocked", result
-        assert policy_profile.read_bytes() == before
+        assert_preserved()
         assert len(calls) == 1
         assert calls[0][1]["allow_session"] is False
         assert calls[0][1]["allow_permanent"] is False

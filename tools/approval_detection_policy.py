@@ -17,8 +17,9 @@ def _security_config_argv_mutation(argv: list[str]) -> bool:
         index += 1
 
     for index, token in enumerate(without_profiles):
-        # Disabling any plugin can remove a native guard; never load it to inspect it.
-        if token == "plugins" and without_profiles[index + 1:index + 2] == ["disable"]:
+        # Disabling or removing any plugin can lose a native guard; never load it to inspect it.
+        if (token == "plugins" and index + 1 < len(without_profiles)
+                and without_profiles[index + 1] in {"disable", "remove"}):
             return True
         if token != "config" or index + 1 >= len(without_profiles):
             continue
