@@ -66,9 +66,13 @@ def _python_hermes_module_argv(tokens: list[str]) -> list[str] | None:
                 if index + 1 < len(tokens) and tokens[index + 1] == "hermes_cli.main":
                     return tokens[index + 2:]
                 return None
-        if token == "--":
-            return None
-        if not token.startswith("-"):
+        script_only = token == "--"
+        if script_only:
+            index += 1
+            if index >= len(tokens):
+                return None
+            token = tokens[index]
+        if script_only or not token.startswith("-"):
             script = token.replace("\\", "/")
             is_hermes = script.endswith("hermes_cli/main.py") or script.rsplit("/", 1)[-1] == "hermes"
             return tokens[index + 1:] if is_hermes else None
@@ -226,6 +230,45 @@ def _security_config_runner_payload_start(tokens: list[str]) -> int | None:
     return None
 
 
+def _literal_runner_executable(tokens: list[str]) -> list[str] | None:
+    """Resolve bounded literal uv/uvx argv; unknown options stay unresolved.
+
+    Reuse wrapper option ownership, without interpreting shell expansion or
+    guessing that later argument data is an executable.
+    """
+    from tools.approval_detection_wrappers import _wrapper_option_consumes_next_arg
+
+    runner = os.path.basename(tokens[0]).lower().removesuffix(".exe")
+    if runner not in {"uv", "uvx"}:
+        return None
+    index, stage, options = 1, ("payload" if runner == "uvx" else "command"), True
+    flags = {"--isolated", "--no-config", "--offline", "--no-cache", "--quiet", "-q",
+             "--verbose", "-v", "--no-sync", "--locked", "--frozen", "--no-project"}
+    while index < len(tokens):
+        token = tokens[index]
+        if options and token == "--":
+            options = False
+            index += 1
+            continue
+        if options and token.startswith("-"):
+            option, equals, _ = token.partition("=")
+            takes_value = option in {"--from"} or _wrapper_option_consumes_next_arg("uv", option)
+            if not takes_value and option not in flags:
+                return None
+            index += 2 if takes_value and not equals else 1
+            continue
+        if stage == "command" and token in {"run", "tool"}:
+            stage = "tool" if token == "tool" else "payload"
+        elif stage == "tool" and token in {"run", "uvx"}:
+            stage = "payload"
+        elif stage == "payload":
+            return tokens[index:]
+        else:
+            return None
+        index += 1
+    return None
+
+
 def _is_hermes_security_config_mutation(command: str) -> bool:
     """Find policy writes or literal child bypasses under the legacy config identity.
 
@@ -233,6 +276,7 @@ def _is_hermes_security_config_mutation(command: str) -> bool:
     scripts, expanded environment values and unrecognized runners are not resolved.
     """
     from tools.approval_detection import (
+        _SHELL_NAMES, _bash_exec_payload,
         _env_split_payload, _iter_shell_command_starts, _iter_shell_command_word_spans,
         _shell_command_segment, _shell_segment_tokens,
     )
@@ -253,12 +297,19 @@ def _is_hermes_security_config_mutation(command: str) -> bool:
             launch_yolo = bool(starts) and _literal_yolo_before(source, word_start, inherited, starts)
             if _security_config_entrypoint_mutation(tokens, launch_yolo=launch_yolo):
                 return True
+            if os.path.basename(tokens[0]).lower() in _SHELL_NAMES:
+                _, payload = _bash_exec_payload(tokens[1:])
+                if payload:
+                    pending.append((payload, launch_yolo))
             if os.path.basename(tokens[0]).lower() == "env":
                 # Reuse the bounded literal env grammar and quote argv on projection:
                 # split-string data is not shell code, and the suffix stays argv.
                 payload = _env_split_payload(tokens)
                 if payload:
                     pending.append((payload, _literal_env_yolo(tokens, launch_yolo)))
+            executable = _literal_runner_executable(tokens)
+            if executable and _security_config_entrypoint_mutation(executable, launch_yolo=launch_yolo):
+                return True
             # Preserve the conservative historical config scan. Child flags use
             # only actual command positions above, never runner argument data.
             payload_start = _security_config_runner_payload_start(tokens)
