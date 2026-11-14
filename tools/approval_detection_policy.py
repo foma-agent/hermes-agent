@@ -117,7 +117,7 @@ def _child_yolo_argv(argv: list[str]) -> bool:
 
 def _literal_env_yolo(tokens: list[str], inherited: bool) -> bool:
     """Apply the existing env wrapper's literal options/assignments, without expansion."""
-    from tools.approval_detection import _wrapper_option_consumes_next_arg
+    from tools.approval_detection_wrappers import _wrapper_option_consumes_next_arg
     from utils import is_truthy_value
 
     index, value, options = 1, inherited, True

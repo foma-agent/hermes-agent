@@ -44,6 +44,7 @@ from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, We
 from gateway.platforms.webhook_mcp_events import (
     handle_mcp_event_control, mcp_event_delivery_id, render_mcp_event_prompt)
 from gateway.response_filters import is_autonomous_silence_response
+from gateway.webhook_targets import is_dispatchable_target, is_known_platform as _is_known_platform
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +52,6 @@ logger = logging.getLogger(__name__)
 # distinct from None (no prefix / default).
 _PROFILE_REJECTED = object()
 _UNPARSEABLE = object()
-
-_BUILTIN_DELIVER_PLATFORMS = {
-    "telegram", "discord", "slack", "signal", "sms", "whatsapp", "matrix", "mattermost",
-    "email", "dingtalk", "feishu", "wecom", "wecom_callback", "weixin",
-    "bluebubbles", "qqbot"}
 
 # ``None`` → aiohttp binds BOTH address families. "0.0.0.0" is IPv4-only (unreachable on IPv6-only
 # networks such as Fly.io 6PN); "::" becomes IPv6-only where the kernel sets IPV6_V6ONLY=1, breaking
@@ -167,16 +163,6 @@ def _signature_pin_error(name: str, route: dict) -> Optional[str]:
         return None
     return (f"[webhook] Route '{name}' has signature {pin!r}; expected one of "
             f"{', '.join(sorted(_SIGNATURE_SCHEMES))} (or omit it to accept every supported scheme).")
-
-
-def _is_known_platform(name: str) -> bool:
-    """Cross-platform delivery target: built-in names or plugin-registered platforms."""
-    if name in _BUILTIN_DELIVER_PLATFORMS:
-        return True
-    with suppress(Exception):
-        from gateway.platform_registry import platform_registry
-        return platform_registry.is_registered(name)
-    return False
 
 
 def _json_error(message: str, status: int) -> web.Response:
@@ -354,7 +340,8 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _deliver_to(self, delivery: dict[str, Any], chat_id: str, content: str) -> SendResult:
         deliver_type = delivery["deliver"]
         if deliver_type == "log":
-            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
+            logger.info("[webhook] Response for %s (%d chars)", chat_id, len(content))
+            logger.debug("[webhook] Response text for %s: %s", chat_id, content)
             return SendResult(success=True)
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
@@ -425,7 +412,7 @@ class WebhookAdapter(BasePlatformAdapter):
         toolsets = route_config.get("toolsets") if isinstance(route_config, dict) else None
         if not isinstance(toolsets, list):
             return None
-        return [str(t).strip() for t in toolsets if str(t).strip()] or None
+        return [str(t).strip() for t in toolsets if str(t).strip()]
 
     # --- HTTP handlers ---
 
@@ -448,6 +435,10 @@ class WebhookAdapter(BasePlatformAdapter):
             return False
         if pin_error := _signature_pin_error(name, route):
             logger.warning("%s Dynamic route skipped.", pin_error)
+            return False
+        if not is_dispatchable_target(deliver := route.get("deliver", "log")):
+            logger.warning("[webhook] Dynamic route '%s' skipped: unknown delivery target %r. "
+                           "Run `hermes webhook list` for a repair command that keeps its settings.", name, deliver)
             return False
         try:
             # Hot-reloaded from the request handler: a malformed block must skip the route, not 500 the request.
@@ -984,7 +975,8 @@ class WebhookAdapter(BasePlatformAdapter):
         """deliver_only: dispatch *content* to the same delivery helpers agent-mode ``send()`` uses."""
         deliver_type = delivery.get("deliver", "log")
         if deliver_type == "log":  # startup validation rejects deliver_only + log; guard defensively
-            logger.info("[webhook] direct-deliver log-only: %s", content[:200])
+            logger.info("[webhook] direct-deliver log-only (%d chars)", len(content))
+            logger.debug("[webhook] direct-deliver log-only text: %s", content)
             return SendResult(success=True)
         if deliver_type == "github_comment":
             return await self._deliver_github_comment(content, delivery)
@@ -1073,6 +1065,10 @@ class WebhookAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"No chat_id or home channel for {platform_name}")
                 chat_id = home.chat_id
             thread_id = extra.get("message_thread_id") or extra.get("thread_id")  # Telegram forum topics
+            # Runtime gate on the FINAL target (payload-rendered chat_id included): a shared-bot
+            # satellite rides the primary's bot only to chats routed to it (#147602).
+            if not self.gateway_runner._shared_bot_target_allowed(target_platform, profile, chat_id, thread_id):
+                return SendResult(success=False, error=f"{platform_name}:{chat_id} is not routed to profile {profile}")
             result = await adapter.send(chat_id, content, metadata={"thread_id": thread_id} if thread_id else None)
             if result.success:
                 self._mirror_delivery(platform_name, str(chat_id), content, delivery, thread_id)
