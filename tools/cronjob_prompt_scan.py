@@ -6,6 +6,8 @@ import re
 
 # Single source of truth shared with the install-time scanner (skills_guard): a narrower
 # cron-local copy once let obfuscated directives slip past this runtime tripwire.
+from tools.threat_patterns import EMOJI_TAG_SEQUENCE_RE as _EMOJI_TAG_SEQUENCE_RE
+from tools.threat_patterns import FORGET_RULES_RAW_RE, mask_negated_forget
 from tools.threat_patterns import INVISIBLE_CHARS as _CRON_INVISIBLE_CHARS
 
 # Logger parity with the origin module (these functions used to log there).
@@ -29,10 +31,13 @@ _CRON_THREAT_PATTERNS = [
     (r'ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions', "prompt_injection"),
     (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
     (r'system\s+prompt\s+override', "sys_prompt_override"),
-    (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
+    (r'disregard\s+(?:\w+\s+){0,8}(your|all|any)\s+(?:\w+\s+){0,8}(instructions|rules|guidelines)', "disregard_rules"),
     (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass|id_rsa|id_ed25519|id_ecdsa)', "read_secrets"),
     (r'authorized_keys', "ssh_backdoor"), (r'/etc/sudoers|visudo', "sudoers_mod"),
     (r'rm\s+-rf\s+/', "destructive_root_rm"),
+    # User prompt only (after the [:4] slice below): "forget" is ordinary prose in skill bodies, which
+    # skills_guard already scans with this same rule at install time.
+    (FORGET_RULES_RAW_RE, "forget_rules"),
 ]
 
 # Looser set for the assembled prompt: command-shape patterns are dropped because skill
@@ -73,7 +78,7 @@ def _zwj_has_emoji_neighbour(text: str, idx: int) -> bool:
 
 
 def _strip_invisible_unicode(prompt: str) -> tuple[str, list[str]]:
-    """Strip invisible-unicode chars, keeping ZWJ inside legitimate emoji.
+    """Strip invisible-unicode chars, keeping ZWJ inside legitimate emoji and subdivision-flag tags.
 
     Returns ``(cleaned, sorted U+XXXX labels removed)``. The skills-attached path sanitizes
     (a stray zero-width space in vetted skill content must not permanently kill the job).
@@ -82,7 +87,11 @@ def _strip_invisible_unicode(prompt: str) -> tuple[str, list[str]]:
         return prompt, []
     removed: set[str] = set()
     cleaned: list[str] = []
+    flag_tags = {i for m in _EMOJI_TAG_SEQUENCE_RE.finditer(prompt) for i in range(m.start() + 1, m.end())}
     for idx, ch in enumerate(prompt):
+        if idx in flag_tags:
+            cleaned.append(ch)
+            continue
         if ch in _CRON_INVISIBLE_CHARS and not (ch == '\u200d' and _zwj_has_emoji_neighbour(prompt, idx)):
             removed.add(f"U+{ord(ch):04X}")
             continue
@@ -103,7 +112,7 @@ _CRON_PATTERN_REMEDIES = {
 def _first_pattern_error(text: str, *pattern_sets) -> str:
     for patterns in pattern_sets:
         for pattern, pid in patterns:
-            if re.search(pattern, text, re.IGNORECASE):
+            if re.search(pattern, mask_negated_forget(text) if pid == "forget_rules" else text, re.IGNORECASE):
                 return (
                     f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not "
                     "contain injection or exfiltration payloads." + _CRON_PATTERN_REMEDIES.get(pid, "")
