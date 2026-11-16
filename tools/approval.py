@@ -73,7 +73,7 @@ def _command_allowlist_approves(command: str) -> bool:
     if not _command_matches_permanent_allowlist(command):
         return False
     dangerous, pattern_key, _ = detect_dangerous_command(command)
-    return not (dangerous and _is_policy_mutation_key(pattern_key))
+    return not hardline_scan_incomplete(command) and not (dangerous and _is_policy_mutation_key(pattern_key))
 
 # --- Consecutive-denial circuit breaker for smart approvals ---------------------------------------------------------
 # Each retry of a smart-denied command burns another guardian LLM call. After ``approvals.denial_breaker_threshold``
@@ -1389,12 +1389,12 @@ def check_dangerous_command(command: str, env_type: str,
     unread = hardline_scan_incomplete(command)
     if _yolo_active() or approval_context._get_approval_mode() == "off":
         return _scan_incomplete_block(_NO_REVIEWER_BYPASS) if unread else _approved()
-    if unread:
+    if not unread and _command_allowlist_approves(command):
+        return _allowlisted(command)
+    if hardline_scan_incomplete(command):
         _approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
         if not (is_cli or is_gateway or is_ask):
             return _scan_incomplete_block(_NO_REVIEWER_PRESENT)
-    elif _command_allowlist_approves(command):
-        return _allowlisted(command)
     session_key = get_current_session_key()
     findings = _command_findings(command)
     scopes = {key: _approval_scope(session_key, key) for key, _ in findings}
@@ -1467,6 +1467,8 @@ def check_all_command_guards(command: str, env_type: str,
         return _scan_incomplete_block(_NO_REVIEWER_BYPASS) if unread else _approved()
     if not unread and _command_allowlist_approves(command):
         return _allowlisted(command)
+    # The policy preflight may have exhausted its budget after the floor scan finished.
+    unread = hardline_scan_incomplete(command)
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     # Outside CLI/gateway/ask flows we never block on approvals: each

@@ -1628,17 +1628,12 @@ def _command_detection_variants(command: str, eval_depth: int = 0, capped: list[
         return True
 
     # Windows-path variant: normalization strips backslashes as shell escapes, so `del C:\Users\me\.ssh\id_rsa`
-    # reaches the patterns as `del C:Usersme.sshid_rsa`. When the RAW command has a drive-letter, UNC, or
-    # dot-relative backslash path, also yield a variant with backslashes flattened to `/` BEFORE normalization.
-    # Gated on a real path shape so POSIX escape semantics (`echo a\"b`) are untouched elsewhere.
+    # reaches the patterns as `del C:Usersme.sshid_rsa`. When the RAW command has a drive-letter or UNC backslash
+    # path, also yield a variant with backslashes flattened to `/` BEFORE normalization. Gated on a real path shape so
+    # POSIX escape semantics (`echo a\"b`) are untouched elsewhere.
     # See #69472.
     pending = [(normalized, eval_depth)]
-    if (
-        re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command)
-        or re.search(r"[A-Za-z]:\\", command)
-        or ".\\" in command
-        or re.search(r"(?:^|[\s;&|()])(?:[^\\\s;&|()\"'`]+\\)+[^\\\s;&|()\"'`]+", command)
-    ):
+    if re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command) or re.search(r"[A-Za-z]:\\", command):
         win_variant = _normalize_command_for_detection(_mask_quoted_newlines(command.replace("\\", "/")))
         if fresh(win_variant):
             yield win_variant
@@ -1843,6 +1838,34 @@ def _quoted_text_is_executed(variant: str, pattern_re: "re.Pattern[str] | _PipeR
 
 
 def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = None):
+    """Retain the ordinary first finding without letting it preapprove a policy write."""
+    descriptions = _iter_nonpolicy_descriptions(command, only)
+    if only is not None:
+        yield from descriptions
+        return
+    first = next(descriptions, None)
+    if first == _PARSER_LIMIT_DESCRIPTION:
+        yield first
+        return
+    from tools.approval_detection_policy import _is_hermes_security_config_mutation
+
+    try:
+        # Both passes share one finite budget. Buffer the ordinary reason before
+        # the policy walk, which may exhaust that budget before resolving argv.
+        for variant in _command_detection_variants(command):
+            if _is_hermes_security_config_mutation(variant):
+                yield _SECURITY_CONFIG_APPROVAL_KEY
+                break
+    except _parser_budget.ParserBudgetExceeded:
+        _parser_budget.record_scan(command, False)
+        yield first or _SCAN_INCOMPLETE_DESCRIPTION
+        return
+    if first is not None:
+        yield first
+    yield from descriptions
+
+
+def _iter_nonpolicy_descriptions(command: str, only: frozenset[str] | None = None):
     """Yield the description (= pattern key) of every dangerous match, in detection order; may repeat.
     *only* restricts the scan to those pattern rules and skips the parser-limit, execution-flag and
     gateway-splice checks, which no content rule is."""
@@ -1859,14 +1882,6 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
     patterns = DANGEROUS_PATTERNS_COMPILED if only is None else [
         (pattern_re, description) for pattern_re, description in DANGEROUS_PATTERNS_COMPILED if description in only
     ]
-    from tools.approval_detection_policy import _is_hermes_security_config_mutation
-
-    # Policy mutations take precedence over co-flagged, persistable findings.
-    if only is None:
-        for command_variant in _command_detection_variants(command):
-            if _is_hermes_security_config_mutation(command_variant):
-                yield _SECURITY_CONFIG_APPROVAL_KEY
-                break
     capped: list[str] = []
     for command_variant in _command_detection_variants(command, capped=capped):
         command_lower = _lower_preserving_flags(command_variant)
@@ -1911,6 +1926,7 @@ def detect_dangerous_command(command: str) -> tuple:
         with _parser_budget.parser_budget(command):
             description = next(_iter_dangerous_descriptions(command), None)
     except _parser_budget.ParserBudgetExceeded:
+        _parser_budget.record_scan(command, False)
         description = _SCAN_INCOMPLETE_DESCRIPTION
     except RecursionError:
         description = _PARSER_LIMIT_DESCRIPTION
