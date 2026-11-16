@@ -87,4 +87,3 @@ def test_remembered_applescript_finding_cannot_cover_a_later_policy_write(tmp_pa
         assert calls[0][1]['allow_permanent'] is False
     finally:
         approval.clear_session(session)
-

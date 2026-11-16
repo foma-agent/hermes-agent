@@ -1850,9 +1850,16 @@ def _iter_dangerous_descriptions(command: str, only: frozenset[str] | None = Non
     from tools.approval_detection_policy import _is_hermes_security_config_mutation
 
     try:
+        from itertools import chain
+
+        # Relative Windows spellings are policy candidates, not alternate
+        # hardline paths: flattening POSIX escapes globally changes their meaning.
+        windows_sources = []
+        if ".\\" in command or re.search(r"(?:^|[\s;&|()])(?:[^\\\s;&|()\"'`]+\\)+[^\\\s;&|()\"'`]+", command):
+            windows_sources.append(_normalize_command_for_detection(_mask_quoted_newlines(command.replace("\\", "/"))))
         # Both passes share one finite budget. Buffer the ordinary reason before
         # the policy walk, which may exhaust that budget before resolving argv.
-        for variant in _command_detection_variants(command):
+        for variant in chain(windows_sources, _command_detection_variants(command)):
             if _is_hermes_security_config_mutation(variant):
                 yield _SECURITY_CONFIG_APPROVAL_KEY
                 break
